@@ -62,6 +62,8 @@ function ownerProfile(profile) {
     ownerId: _ownerId,
     avatarProviderCode: _avatarProviderCode,
     avatarModel,
+    portraitAvatar,
+    lamAvatar,
     ...publicProfile
   } = profile;
   return {
@@ -75,6 +77,27 @@ function ownerProfile(profile) {
             rigProfile: avatarModel.rigProfile,
             updatedAt: avatarModel.updatedAt,
             url: `/api/robosa/profiles/${encodeURIComponent(profile.handle)}/avatar.glb?v=${String(avatarModel.sha256 || '').slice(0, 12)}`,
+          }
+        : null,
+    portraitAvatar:
+      portraitAvatar?.status === 'ready'
+        ? {
+            status: 'ready',
+            contentType: portraitAvatar.contentType,
+            size: portraitAvatar.size,
+            updatedAt: portraitAvatar.updatedAt,
+            url: `/api/robosa/profiles/${encodeURIComponent(profile.handle)}/portrait?v=${String(portraitAvatar.sha256 || '').slice(0, 12)}`,
+          }
+        : null,
+    lamAvatar:
+      lamAvatar?.status === 'ready'
+        ? {
+            status: 'ready',
+            provider: lamAvatar.provider,
+            size: lamAvatar.size,
+            rigProfile: lamAvatar.rigProfile,
+            updatedAt: lamAvatar.updatedAt,
+            url: `/api/robosa/profiles/${encodeURIComponent(profile.handle)}/avatar.lam.zip?v=${String(lamAvatar.sha256 || '').slice(0, 12)}`,
           }
         : null,
   };
@@ -151,6 +174,8 @@ export function createRobosaService(store) {
         handle,
         avatarMediaId: '',
         avatarModel: null,
+        portraitAvatar: null,
+        lamAvatar: null,
         ownerId: user.id,
         createdAt: now,
         updatedAt: now,
@@ -230,7 +255,12 @@ export function createRobosaService(store) {
   async function updateProfile(ownerId, candidate) {
     const sanitized = sanitizeProfile(candidate);
     const handle = validateHandle(sanitized.handle);
-    const { avatarModel: _candidateAvatar, ...editableProfile } = sanitized;
+    const {
+      avatarModel: _candidateAvatar,
+      portraitAvatar: _candidatePortrait,
+      lamAvatar: _candidateLam,
+      ...editableProfile
+    } = sanitized;
     return store.mutate((database) => {
       const profile = database.profiles.find(
         (item) => item.ownerId === ownerId,
@@ -379,6 +409,7 @@ export function createRobosaService(store) {
         rigProfile: 'oculus-15',
         updatedAt: now,
       };
+      profile.avatarMode = '3d';
       profile.avatarProviderCode = String(candidate?.avatarCode || '').slice(
         0,
         200,
@@ -409,16 +440,103 @@ export function createRobosaService(store) {
     });
   }
 
+  async function completePortrait(ownerId, candidate) {
+    return store.mutate((database) => {
+      const profile = database.profiles.find(
+        (item) => item.ownerId === ownerId,
+      );
+      if (!profile) fail(404, 'PROFILE_NOT_FOUND', 'Profile not found.');
+      const now = new Date().toISOString();
+      profile.portraitAvatar = {
+        status: 'ready',
+        contentType: String(candidate?.contentType || 'image/jpeg'),
+        size: Number(candidate?.size) || 0,
+        sha256: String(candidate?.sha256 || ''),
+        updatedAt: now,
+      };
+      profile.avatarMode = 'portrait';
+      profile.updatedAt = now;
+      return ownerProfile(profile);
+    });
+  }
+
+  async function portraitAccess(profileHandle, ownerId = '') {
+    const normalized = normalizeHandle(profileHandle);
+    return store.read((database) => {
+      const profile = database.profiles.find(
+        (item) => item.handle === normalized,
+      );
+      if (
+        !profile ||
+        profile.portraitAvatar?.status !== 'ready' ||
+        (profile.visibility === 'private' && profile.ownerId !== ownerId)
+      ) {
+        return null;
+      }
+      return {
+        ownerId: profile.ownerId,
+        handle: profile.handle,
+        portraitAvatar: { ...profile.portraitAvatar },
+      };
+    });
+  }
+
+  async function completeLamAvatar(ownerId, candidate) {
+    return store.mutate((database) => {
+      const profile = database.profiles.find(
+        (item) => item.ownerId === ownerId,
+      );
+      if (!profile) fail(404, 'PROFILE_NOT_FOUND', 'Profile not found.');
+      const now = new Date().toISOString();
+      profile.lamAvatar = {
+        status: 'ready',
+        provider: 'lam',
+        size: Number(candidate?.size) || 0,
+        sha256: String(candidate?.sha256 || ''),
+        rigProfile: 'arkit-52',
+        updatedAt: now,
+      };
+      profile.avatarMode = 'lam';
+      profile.updatedAt = now;
+      return ownerProfile(profile);
+    });
+  }
+
+  async function lamAvatarAccess(profileHandle, ownerId = '') {
+    const normalized = normalizeHandle(profileHandle);
+    return store.read((database) => {
+      const profile = database.profiles.find(
+        (item) => item.handle === normalized,
+      );
+      if (
+        !profile ||
+        profile.lamAvatar?.status !== 'ready' ||
+        (profile.visibility === 'private' && profile.ownerId !== ownerId)
+      ) {
+        return null;
+      }
+      return {
+        ownerId: profile.ownerId,
+        handle: profile.handle,
+        lamAvatar: { ...profile.lamAvatar },
+      };
+    });
+  }
+
   return {
     appendTurn,
     avatarAccess,
     completeAvatar,
+    completeLamAvatar,
+    completePortrait,
     conversation,
     createBooking,
     listBookings,
     login,
+    lamAvatarAccess,
     logout,
     publicProfile,
+    portraitAccess,
     register,
     sessionByHash,
     updateBooking,

@@ -75,6 +75,12 @@ export async function removeMedia(id) {
 }
 
 export function mediaKind(record) {
+  if (
+    String(record?.type || '') === 'application/zip' ||
+    /\.zip$/i.test(String(record?.name || ''))
+  ) {
+    return 'lam';
+  }
   if (String(record?.type || '').startsWith('image/')) return 'image';
   if (String(record?.type || '').startsWith('video/')) return 'video';
   if (

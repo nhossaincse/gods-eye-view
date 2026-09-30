@@ -34,6 +34,8 @@ Set `ROBOSA_DATA_DIR` to use a different directory.
 - Reconstruction capture readiness and direct rigged GLB/VRM import
 - Embedded MetaPerson portrait-to-3D generation and GLB export
 - Private generated-model storage with profile-aware public delivery
+- LAM Gaussian-avatar ZIP playback with 52-channel ARKit facial animation
+- Visibility-aware LAM archive upload and public delivery
 - Device-local photo and video source material in IndexedDB
 - Desktop and mobile layouts
 
@@ -50,10 +52,11 @@ Set `ROBOSA_DATA_DIR` to use a different directory.
 
 The JSON store is a development persistence adapter, not a production database.
 Source photos, videos, and manually imported GLB files stay on the owner's
-current device. MetaPerson-generated GLBs are copied into the private Robosa
-data directory and served through the profile visibility policy, so visitors on
-other devices can see the generated twin. Portraits are treated as
-reconstruction inputs and are never pasted onto the demo character. The
+current device. MetaPerson-generated GLBs and imported LAM ZIPs are copied into
+the private Robosa data directory and served through the profile visibility
+policy, so visitors on other devices can see the generated twin. Plain
+portraits are static reconstruction inputs; Robosa no longer simulates lip sync
+by scaling a crop of the source image. The
 MetaPerson integration needs provider credentials and sends the selected
 portrait to that provider after the owner starts generation. Expression video
 is retained locally for a future high-fidelity worker and is not sent to
@@ -78,6 +81,7 @@ create a calendar event.
 - `src/robosa/mediaStore.js`: device-local IndexedDB photo/video storage
 - `src/robosa/avatarStore.js`: local 3D source and consent configuration
 - `src/robosa/twin3d.js`: Three.js character, GLB loading, and facial rig driver
+- `src/robosa/lamTwin.js`: LAM WebRender lifecycle and viseme-to-ARKit adapter
 - `src/robosa/avatarRig.js`: Oculus, VRM, and jaw-fallback rig mapping
 - `src/robosa/audioLipSync.js`: streamed audio viseme analysis adapter
 - `src/robosa/metaPersonCreator.js`: secure embedded generation/export client
@@ -94,7 +98,7 @@ create a calendar event.
 
 ## Next production milestone
 
-1. Add a video-based high-fidelity worker behind the existing avatar job contract.
+1. Deploy LAM and LAM Audio2Expression on a licensed NVIDIA worker behind the avatar job contract.
 2. Replace the JSON adapter with Postgres and encrypted object storage.
 3. Add email verification, password recovery, and abuse controls.
 4. Add reviewed document/media ingestion and permission-scoped retrieval.

@@ -23,10 +23,13 @@ export const DEFAULT_PROFILE = Object.freeze({
     'The best way to start a collaboration is to share the problem, timeline, and desired outcome.',
   ],
   avatarMediaId: '',
+  avatarMode: '3d',
   allowBooking: true,
   speakReplies: true,
   visibility: 'public',
   avatarModel: null,
+  portraitAvatar: null,
+  lamAvatar: null,
 });
 
 function sanitizeAvatarModel(value) {
@@ -36,6 +39,33 @@ function sanitizeAvatarModel(value) {
     provider: String(value.provider || '').slice(0, 40),
     size: Math.max(0, Number(value.size) || 0),
     rigProfile: String(value.rigProfile || '').slice(0, 40),
+    updatedAt: String(value.updatedAt || '').slice(0, 40),
+    url: String(value.url || '').slice(0, 500),
+  };
+}
+
+function sanitizePortraitAvatar(value) {
+  if (value?.status !== 'ready' || !value?.url) return null;
+  return {
+    status: 'ready',
+    contentType: ['image/jpeg', 'image/png', 'image/webp'].includes(
+      value.contentType,
+    )
+      ? value.contentType
+      : 'image/jpeg',
+    size: Math.max(0, Number(value.size) || 0),
+    updatedAt: String(value.updatedAt || '').slice(0, 40),
+    url: String(value.url || '').slice(0, 500),
+  };
+}
+
+function sanitizeLamAvatar(value) {
+  if (value?.status !== 'ready' || !value?.url) return null;
+  return {
+    status: 'ready',
+    provider: String(value.provider || 'lam').slice(0, 40),
+    size: Math.max(0, Number(value.size) || 0),
+    rigProfile: String(value.rigProfile || 'arkit-52').slice(0, 40),
     updatedAt: String(value.updatedAt || '').slice(0, 40),
     url: String(value.url || '').slice(0, 500),
   };
@@ -142,6 +172,9 @@ export function sanitizeProfile(candidate) {
             .slice(0, 30)
         : fallback.facts,
     avatarMediaId: String(source.avatarMediaId || '').slice(0, 100),
+    avatarMode: ['portrait', 'lam'].includes(source.avatarMode)
+      ? source.avatarMode
+      : '3d',
     allowBooking:
       typeof source.allowBooking === 'boolean'
         ? source.allowBooking
@@ -152,6 +185,8 @@ export function sanitizeProfile(candidate) {
         : fallback.speakReplies,
     visibility,
     avatarModel: sanitizeAvatarModel(source.avatarModel),
+    portraitAvatar: sanitizePortraitAvatar(source.portraitAvatar),
+    lamAvatar: sanitizeLamAvatar(source.lamAvatar),
   };
 }
 

@@ -1,4 +1,6 @@
-import { readRequestBody } from '../common/request.js';
+import { readRequestBody, readRequestBodyCapped } from '../common/request.js';
+import JSZip from 'jszip';
+import { readFileSync } from 'node:fs';
 import {
   expiredSessionCookie,
   sessionCookie,
@@ -11,10 +13,19 @@ import {
   MetaPersonError,
   requestMetaPersonAccessToken,
 } from './metaperson.js';
+import {
+  createLamWorkerJob,
+  deleteLamWorkerJob,
+  downloadLamWorkerArtifact,
+  getLamWorkerJob,
+  LamWorkerError,
+} from './lamWorker.js';
 import { createRobosaService, RobosaServiceError } from './service.js';
 import { createRobosaStore } from './store.js';
 
 const BODY_LIMIT = 64 * 1024;
+const PORTRAIT_LIMIT = 10 * 1024 * 1024;
+const LAM_ARCHIVE_LIMIT = 120 * 1024 * 1024;
 
 function writeJson(response, status, payload, headers = {}) {
   response.statusCode = status;
@@ -39,6 +50,150 @@ function writeAvatarModel(response, model, access) {
     `inline; filename="${access.handle}-twin.glb"`,
   );
   response.end(model);
+}
+
+function writePortrait(response, portrait, access) {
+  response.statusCode = 200;
+  response.setHeader('Content-Type', access.portraitAvatar.contentType);
+  response.setHeader('Content-Length', String(portrait.length));
+  response.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
+  response.setHeader('X-Content-Type-Options', 'nosniff');
+  response.setHeader('ETag', `"${access.portraitAvatar.sha256}"`);
+  response.setHeader(
+    'Content-Disposition',
+    `inline; filename="${access.handle}-portrait"`,
+  );
+  response.end(portrait);
+}
+
+function writeLamAvatar(response, archive, access) {
+  response.statusCode = 200;
+  response.setHeader('Content-Type', 'application/zip');
+  response.setHeader('Content-Length', String(archive.length));
+  response.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
+  response.setHeader('X-Content-Type-Options', 'nosniff');
+  response.setHeader('ETag', `"${access.lamAvatar.sha256}"`);
+  response.setHeader(
+    'Content-Disposition',
+    `inline; filename="${access.handle}-lam-avatar.zip"`,
+  );
+  response.end(archive);
+}
+
+function portraitContentType(buffer) {
+  if (
+    buffer.length >= 3 &&
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[2] === 0xff
+  ) {
+    return 'image/jpeg';
+  }
+  if (
+    buffer.length >= 8 &&
+    buffer
+      .subarray(0, 8)
+      .equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  ) {
+    return 'image/png';
+  }
+  if (
+    buffer.length >= 12 &&
+    buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buffer.subarray(8, 12).toString('ascii') === 'WEBP'
+  ) {
+    return 'image/webp';
+  }
+  return '';
+}
+
+async function readPortrait(request) {
+  try {
+    const portrait = await readRequestBodyCapped(request, PORTRAIT_LIMIT);
+    const contentType = portraitContentType(portrait);
+    if (!contentType) {
+      throw new RobosaServiceError(
+        415,
+        'PORTRAIT_FORMAT_UNSUPPORTED',
+        'Use a JPEG, PNG, or WebP portrait.',
+      );
+    }
+    return { portrait, contentType };
+  } catch (error) {
+    if (error?.code === 'BODY_TOO_LARGE') {
+      throw new RobosaServiceError(
+        413,
+        'PORTRAIT_TOO_LARGE',
+        'Portrait images must be 10 MB or smaller.',
+      );
+    }
+    throw error;
+  }
+}
+
+async function readLamArchive(request) {
+  try {
+    const archive = await readRequestBodyCapped(request, LAM_ARCHIVE_LIMIT);
+    return await validateLamArchive(archive);
+  } catch (error) {
+    if (error?.code === 'BODY_TOO_LARGE') {
+      throw new RobosaServiceError(
+        413,
+        'LAM_ARCHIVE_TOO_LARGE',
+        'LAM avatar archives must be 120 MB or smaller.',
+      );
+    }
+    throw error;
+  }
+}
+
+async function validateLamArchive(archive) {
+  try {
+    if (
+      archive.length < 4 ||
+      archive[0] !== 0x50 ||
+      archive[1] !== 0x4b ||
+      archive[2] !== 0x03 ||
+      archive[3] !== 0x04
+    ) {
+      throw new RobosaServiceError(
+        415,
+        'LAM_FORMAT_UNSUPPORTED',
+        'Import the ZIP exported by LAM.',
+      );
+    }
+    let zip;
+    try {
+      zip = await JSZip.loadAsync(archive);
+    } catch {
+      throw new RobosaServiceError(
+        415,
+        'LAM_ARCHIVE_INVALID',
+        'The LAM ZIP could not be read.',
+      );
+    }
+    const names = Object.values(zip.files)
+      .filter((entry) => !entry.dir && !entry.name.startsWith('__MACOSX/'))
+      .map((entry) => entry.name);
+    const skin = names.find((name) => name.endsWith('/skin.glb'));
+    const root = skin?.slice(0, -'skin.glb'.length) || '';
+    const required = [
+      'skin.glb',
+      'animation.glb',
+      'offset.ply',
+      'vertex_order.json',
+    ];
+    if (!root || !required.every((name) => names.includes(`${root}${name}`))) {
+      throw new RobosaServiceError(
+        415,
+        'LAM_ARCHIVE_INVALID',
+        'The ZIP is missing required LAM avatar files.',
+      );
+    }
+    return archive;
+  } catch (error) {
+    throw error;
+  }
 }
 
 async function readJson(request) {
@@ -113,9 +268,24 @@ export function createRobosaApiHandler({
   metaPersonClientId = process.env.ROBOSA_METAPERSON_CLIENT_ID,
   metaPersonClientSecret = process.env.ROBOSA_METAPERSON_CLIENT_SECRET,
   metaPersonDownloadHosts = process.env.ROBOSA_METAPERSON_DOWNLOAD_HOSTS,
+  lamWorkerUrl = process.env.ROBOSA_LAM_WORKER_URL,
+  lamWorkerToken = process.env.ROBOSA_LAM_WORKER_TOKEN,
+  lamWorkerTokenFile = process.env.ROBOSA_LAM_WORKER_TOKEN_FILE,
 } = {}) {
   const service = createRobosaService(store);
   const allow = createLimiter();
+  const lamJobs = new Map();
+  const configuredLamWorkerToken =
+    lamWorkerToken ||
+    (() => {
+      try {
+        return lamWorkerTokenFile
+          ? readFileSync(lamWorkerTokenFile, 'utf8').trim()
+          : '';
+      } catch {
+        return '';
+      }
+    })();
 
   async function authenticated(request) {
     return service.sessionByHash(sessionHashFromRequest(request));
@@ -266,6 +436,115 @@ export function createRobosaApiHandler({
         return;
       }
 
+      if (method === 'PUT' && path === '/avatar/portrait') {
+        const session = await requireOwner(request);
+        const { portrait, contentType } = await readPortrait(request);
+        const stored = await avatarFiles.writePortrait(
+          session.user.id,
+          portrait,
+        );
+        const profile = await service.completePortrait(session.user.id, {
+          ...stored,
+          contentType,
+        });
+        writeJson(response, 201, { profile });
+        return;
+      }
+
+      if (method === 'PUT' && path === '/avatar/lam') {
+        const session = await requireOwner(request);
+        const archive = await readLamArchive(request);
+        const stored = await avatarFiles.writeLam(session.user.id, archive);
+        const profile = await service.completeLamAvatar(
+          session.user.id,
+          stored,
+        );
+        writeJson(response, 201, { profile });
+        return;
+      }
+
+      if (method === 'POST' && path === '/avatar/lam/jobs') {
+        const session = await requireOwner(request);
+        if (!allow(`lam-job:${session.user.id}`, 5, 60 * 60 * 1000)) {
+          throw new RobosaServiceError(
+            429,
+            'RATE_LIMITED',
+            'Too many LAM generation attempts. Try again later.',
+          );
+        }
+        const consentAt = String(request.headers['x-robosa-consent-at'] || '');
+        if (!consentAt || !Number.isFinite(Date.parse(consentAt))) {
+          throw new RobosaServiceError(
+            400,
+            'CONSENT_REQUIRED',
+            'Record subject consent before generating a LAM portrait.',
+          );
+        }
+        const { portrait, contentType } = await readPortrait(request);
+        const job = await createLamWorkerJob({
+          baseUrl: lamWorkerUrl,
+          token: configuredLamWorkerToken,
+          portrait,
+          contentType,
+          consentAt,
+          fetchImpl,
+        });
+        lamJobs.set(job.id, { ownerId: session.user.id, profile: null });
+        writeJson(response, 202, { job });
+        return;
+      }
+
+      const lamJobStatus = path.match(
+        /^\/avatar\/lam\/jobs\/(avjob_[a-f0-9]+)$/i,
+      );
+      if (method === 'GET' && lamJobStatus) {
+        const session = await requireOwner(request);
+        const jobId = lamJobStatus[1];
+        const tracked = lamJobs.get(jobId);
+        if (!tracked || tracked.ownerId !== session.user.id) {
+          throw new RobosaServiceError(
+            404,
+            'LAM_JOB_NOT_FOUND',
+            'LAM generation job not found.',
+          );
+        }
+        const job = await getLamWorkerJob({
+          baseUrl: lamWorkerUrl,
+          token: configuredLamWorkerToken,
+          jobId,
+          fetchImpl,
+        });
+        if (job.status === 'complete' && !tracked.profile) {
+          const archive = await downloadLamWorkerArtifact({
+            baseUrl: lamWorkerUrl,
+            token: configuredLamWorkerToken,
+            artifactUrl: job.artifactUrl,
+            fetchImpl,
+          });
+          await validateLamArchive(archive);
+          const stored = await avatarFiles.writeLam(session.user.id, archive);
+          tracked.profile = await service.completeLamAvatar(
+            session.user.id,
+            stored,
+          );
+          try {
+            await deleteLamWorkerJob({
+              baseUrl: lamWorkerUrl,
+              token: configuredLamWorkerToken,
+              jobId,
+              fetchImpl,
+            });
+          } catch {
+            console.warn('[robosa] LAM worker cleanup failed');
+          }
+        }
+        writeJson(response, 200, {
+          job,
+          ...(tracked.profile ? { profile: tracked.profile } : {}),
+        });
+        return;
+      }
+
       const bookingUpdate = path.match(/^\/bookings\/([a-f0-9-]+)$/i);
       if (method === 'PATCH' && bookingUpdate) {
         const session = await requireOwner(request);
@@ -383,6 +662,97 @@ export function createRobosaApiHandler({
         return;
       }
 
+      const publicPortrait = path.match(
+        /^\/profiles\/([a-z0-9-]{2,40})\/portrait$/i,
+      );
+      if (['GET', 'HEAD'].includes(method) && publicPortrait) {
+        const session = await authenticated(request);
+        const access = await service.portraitAccess(
+          publicPortrait[1],
+          session?.user.id,
+        );
+        if (!access) {
+          writeJson(response, 404, {
+            error: {
+              code: 'PORTRAIT_NOT_FOUND',
+              message: 'Portrait not found.',
+            },
+          });
+          return;
+        }
+        if (method === 'HEAD') {
+          response.statusCode = 200;
+          response.setHeader('Content-Type', access.portraitAvatar.contentType);
+          response.setHeader(
+            'Content-Length',
+            String(access.portraitAvatar.size),
+          );
+          response.setHeader('ETag', `"${access.portraitAvatar.sha256}"`);
+          response.end();
+          return;
+        }
+        try {
+          writePortrait(
+            response,
+            await avatarFiles.readPortrait(access.ownerId),
+            access,
+          );
+        } catch (error) {
+          if (error?.code !== 'ENOENT') throw error;
+          writeJson(response, 404, {
+            error: {
+              code: 'PORTRAIT_NOT_FOUND',
+              message: 'Portrait not found.',
+            },
+          });
+        }
+        return;
+      }
+
+      const publicLamAvatar = path.match(
+        /^\/profiles\/([a-z0-9-]{2,40})\/avatar\.lam\.zip$/i,
+      );
+      if (['GET', 'HEAD'].includes(method) && publicLamAvatar) {
+        const session = await authenticated(request);
+        const access = await service.lamAvatarAccess(
+          publicLamAvatar[1],
+          session?.user.id,
+        );
+        if (!access) {
+          writeJson(response, 404, {
+            error: {
+              code: 'LAM_AVATAR_NOT_FOUND',
+              message: 'LAM avatar not found.',
+            },
+          });
+          return;
+        }
+        if (method === 'HEAD') {
+          response.statusCode = 200;
+          response.setHeader('Content-Type', 'application/zip');
+          response.setHeader('Content-Length', String(access.lamAvatar.size));
+          response.setHeader('ETag', `"${access.lamAvatar.sha256}"`);
+          response.end();
+          return;
+        }
+        try {
+          writeLamAvatar(
+            response,
+            await avatarFiles.readLam(access.ownerId),
+            access,
+          );
+        } catch (error) {
+          if (error?.code !== 'ENOENT') throw error;
+          writeJson(response, 404, {
+            error: {
+              code: 'LAM_AVATAR_NOT_FOUND',
+              message: 'LAM avatar not found.',
+            },
+          });
+        }
+        return;
+      }
+
       const publicProfile = path.match(/^\/profiles\/([a-z0-9-]{2,40})$/i);
       if (method === 'GET' && publicProfile) {
         const session = await authenticated(request);
@@ -406,7 +776,8 @@ export function createRobosaApiHandler({
     } catch (error) {
       if (
         error instanceof RobosaServiceError ||
-        error instanceof MetaPersonError
+        error instanceof MetaPersonError ||
+        error instanceof LamWorkerError
       ) {
         writeJson(response, error.status, {
           error: { code: error.code, message: error.message },

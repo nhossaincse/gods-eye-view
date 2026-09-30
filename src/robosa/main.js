@@ -2,7 +2,9 @@ import { BrowserVoice } from './browserVoice.js';
 import { AudioDrivenLipSync } from './audioLipSync.js';
 import { loadAvatarConfig, saveAvatarConfig } from './avatarStore.js';
 import { addMedia, listMedia, mediaKind, removeMedia } from './mediaStore.js';
+import { LamTwinStage } from './lamTwin.js';
 import { MetaPersonCreator } from './metaPersonCreator.js';
+import { PortraitTwinStage } from './portraitTwin.js';
 import {
   loadProfile,
   normalizeHandle,
@@ -23,12 +25,13 @@ const app = document.querySelector('#robosa-app');
 const toast = document.querySelector('#robosa-toast');
 const DEFAULT_AVATAR = '/robosa-twin-default.png';
 const MAX_MEDIA_BYTES = 30 * 1024 * 1024;
+const MAX_LAM_BYTES = 120 * 1024 * 1024;
 const localProfile = loadProfile();
 
 const STUDIO_TABS = Object.freeze([
   { id: 'identity', label: 'Identity', icon: 'person' },
   { id: 'knowledge', label: 'Knowledge', icon: 'description' },
-  { id: 'appearance', label: '3D Twin', icon: 'view_in_ar' },
+  { id: 'appearance', label: 'Twin look', icon: 'view_in_ar' },
   { id: 'voice', label: 'Voice', icon: 'record_voice_over' },
   { id: 'permissions', label: 'Boundaries', icon: 'shield' },
 ]);
@@ -56,6 +59,7 @@ const state = {
   speaking: false,
   runtimeStatus: 'disconnected',
   rigReport: null,
+  lamJob: null,
   audioEnabled: true,
   selectedSlot: '',
   toastTimer: 0,
@@ -256,12 +260,29 @@ function mediaUrl(record) {
 }
 
 function avatarUrl() {
+  const portrait = portraitSourceUrl();
+  if (portrait) return portrait;
   const avatar = state.media.find(
     (record) =>
       record.id === state.profile.avatarMediaId &&
       mediaKind(record) === 'image',
   );
   return avatar ? mediaUrl(avatar) : DEFAULT_AVATAR;
+}
+
+function localAvatarApplies() {
+  return (
+    routeFromLocation().view === 'studio' ||
+    state.avatar.profileHandle === state.profile.handle
+  );
+}
+
+function portraitSourceUrl() {
+  const localPortrait = localAvatarApplies() ? avatarPortraitRecord() : null;
+  if (localPortrait) return mediaUrl(localPortrait);
+  return state.profile.portraitAvatar?.status === 'ready'
+    ? state.profile.portraitAvatar.url
+    : '';
 }
 
 function avatarPortraitRecord() {
@@ -279,18 +300,34 @@ function avatarModelRecord() {
   );
 }
 
+function lamAvatarRecord() {
+  return state.media.find(
+    (record) =>
+      record.id === state.avatar.lamMediaId && mediaKind(record) === 'lam',
+  );
+}
+
 function hostedAvatarModel() {
   return state.profile.avatarModel?.status === 'ready'
     ? state.profile.avatarModel
     : null;
 }
 
+function hostedLamAvatar() {
+  return state.profile.lamAvatar?.status === 'ready'
+    ? state.profile.lamAvatar
+    : null;
+}
+
 function activeAvatarKind() {
-  const localAvatarApplies =
-    routeFromLocation().view === 'studio' ||
-    state.avatar.profileHandle === state.profile.handle;
+  if (state.profile.avatarMode === 'lam' && hostedLamAvatar()) {
+    return 'lam';
+  }
+  if (state.profile.avatarMode === 'portrait' && portraitSourceUrl()) {
+    return 'portrait';
+  }
   if (
-    localAvatarApplies &&
+    localAvatarApplies() &&
     state.avatar.mode === 'model' &&
     avatarModelRecord()
   ) {
@@ -300,13 +337,42 @@ function activeAvatarKind() {
   return 'demo';
 }
 
+function avatarKindLabel(kind = activeAvatarKind()) {
+  return (
+    {
+      portrait: 'Static portrait',
+      lam: 'LAM portrait',
+      generated: 'Generated 3D',
+      imported: 'Imported 3D',
+      demo: 'Demo character',
+    }[kind] || 'Demo character'
+  );
+}
+
 function mountTwinStage() {
   const container = document.querySelector('[data-twin-stage]');
   if (!container) return;
-  const localAvatarApplies =
-    routeFromLocation().view === 'studio' ||
-    state.avatar.profileHandle === state.profile.handle;
-  const model = localAvatarApplies ? avatarModelRecord() : null;
+  const avatarKind = activeAvatarKind();
+  if (avatarKind === 'lam') {
+    twinStage = new LamTwinStage(container, {
+      assetUrl: hostedLamAvatar().url,
+      onError: showToast,
+      onReady: (report) => {
+        state.rigReport = report;
+        updateRigReadiness();
+      },
+    });
+    twinStage.setSpeaking(state.speaking);
+    return;
+  }
+  if (avatarKind === 'portrait') {
+    twinStage = new PortraitTwinStage(container, {
+      imageUrl: portraitSourceUrl(),
+    });
+    twinStage.setSpeaking(state.speaking);
+    return;
+  }
+  const model = localAvatarApplies() ? avatarModelRecord() : null;
   const localModelActive = state.avatar.mode === 'model' && model;
   const generatedModel = hostedAvatarModel();
   twinStage = new Twin3DStage(container, {
@@ -333,6 +399,13 @@ function rigReadinessCopy(report = state.rigReport) {
       level: 'checking',
       title: 'Inspecting facial rig',
       detail: 'Checking morph targets and VRM expressions.',
+    };
+  }
+  if (report.level === 'arkit') {
+    return {
+      level: report.level,
+      title: 'LAM facial animation ready',
+      detail: `${report.expressions?.length || 52} ARKit expressions available for speech and blinks.`,
     };
   }
   if (report.level === 'full') {
@@ -585,9 +658,12 @@ function mediaItem(record) {
   const url = mediaUrl(record);
   const isAvatar = state.avatar.portraitMediaId === record.id;
   const isReference = state.avatar.referenceVideoId === record.id;
+  const isLam = state.avatar.lamMediaId === record.id;
+  const canPublishLam = Boolean(state.avatar.consentAt);
   const isModel =
     state.avatar.mode === 'model' && state.avatar.modelMediaId === record.id;
-  const modelFormat = /\.vrm$/i.test(record.name) ? 'VRM' : 'GLB';
+  const modelFormat =
+    kind === 'lam' ? 'LAM ZIP' : /\.vrm$/i.test(record.name) ? 'VRM' : 'GLB';
   let media = `<div class="model-media-preview">${icon('view_in_ar')}<span>${modelFormat}</span></div>`;
   if (kind === 'image') {
     media = `<img src="${escapeHtml(url)}" alt="${escapeHtml(record.name)}" />`;
@@ -603,7 +679,9 @@ function mediaItem(record) {
             ? `<button class="media-action" type="button" data-action="set-avatar" data-media-id="${escapeHtml(record.id)}" ${isAvatar ? 'disabled' : ''} title="${isAvatar ? 'Selected portrait' : 'Use as portrait'}" aria-label="${isAvatar ? 'Selected portrait' : `Use ${escapeHtml(record.name)} as portrait`}">${isAvatar ? icon('check') : icon('person')}</button>`
             : kind === 'video'
               ? `<button class="media-action" type="button" data-action="set-reference-video" data-media-id="${escapeHtml(record.id)}" ${isReference ? 'disabled' : ''} title="${isReference ? 'Selected reference video' : 'Use as reference video'}" aria-label="${isReference ? 'Selected reference video' : `Use ${escapeHtml(record.name)} as reference video`}">${isReference ? icon('check') : icon('video_library')}</button>`
-              : `<button class="media-action" type="button" data-action="use-3d-model" data-media-id="${escapeHtml(record.id)}" ${isModel ? 'disabled' : ''} title="${isModel ? 'Active 3D model' : 'Use 3D model'}" aria-label="${isModel ? 'Active 3D model' : `Use ${escapeHtml(record.name)} as 3D model`}">${isModel ? icon('check') : icon('view_in_ar')}</button>`
+              : kind === 'lam'
+                ? `<button class="media-action" type="button" data-action="use-lam-avatar" data-media-id="${escapeHtml(record.id)}" ${isLam && state.profile.avatarMode === 'lam' ? 'disabled' : canPublishLam ? '' : 'disabled'} title="${isLam && state.profile.avatarMode === 'lam' ? 'Active LAM avatar' : canPublishLam ? 'Publish LAM avatar' : 'Record consent before publishing'}" aria-label="${isLam && state.profile.avatarMode === 'lam' ? 'Active LAM avatar' : canPublishLam ? `Publish ${escapeHtml(record.name)} as LAM avatar` : 'Record consent before publishing this LAM avatar'}">${isLam && state.profile.avatarMode === 'lam' ? icon('check') : icon('face')}</button>`
+                : `<button class="media-action" type="button" data-action="use-3d-model" data-media-id="${escapeHtml(record.id)}" ${isModel ? 'disabled' : ''} title="${isModel ? 'Active 3D model' : 'Use 3D model'}" aria-label="${isModel ? 'Active 3D model' : `Use ${escapeHtml(record.name)} as 3D model`}">${isModel ? icon('check') : icon('view_in_ar')}</button>`
         }
         <button class="media-action" type="button" data-action="remove-media" data-media-id="${escapeHtml(record.id)}" title="Remove" aria-label="Remove ${escapeHtml(record.name)}">${icon('delete')}</button>
       </div>
@@ -611,7 +689,8 @@ function mediaItem(record) {
 }
 
 function appearancePanel() {
-  const hasPortrait = Boolean(avatarPortraitRecord());
+  const hasLocalPortrait = Boolean(avatarPortraitRecord());
+  const hasPortrait = Boolean(hasLocalPortrait || state.profile.portraitAvatar);
   const hasVideo = Boolean(
     state.media.find(
       (record) =>
@@ -620,22 +699,59 @@ function appearancePanel() {
     ),
   );
   const hasConsent = Boolean(state.avatar.consentAt);
+  const canUseLam = Boolean(
+    hostedLamAvatar() || (lamAvatarRecord() && hasConsent),
+  );
+  const canUsePortrait = Boolean(
+    state.profile.portraitAvatar || (hasLocalPortrait && hasConsent),
+  );
   const avatarKind = activeAvatarKind();
+  const lamJobActive = ['queued', 'running'].includes(state.lamJob?.status);
   const status =
-    avatarKind === 'generated'
-      ? 'Generated 3D twin active'
-      : avatarKind === 'imported'
-        ? 'Imported 3D model active'
-        : state.avatar.captureStatus === 'ready'
-          ? 'Capture package ready'
-          : 'Demo character active';
-  const rigCopy = rigReadinessCopy();
+    avatarKind === 'lam'
+      ? 'LAM portrait active'
+      : avatarKind === 'portrait'
+        ? 'Static portrait active'
+        : avatarKind === 'generated'
+          ? 'Generated 3D twin active'
+          : avatarKind === 'imported'
+            ? 'Imported 3D model active'
+            : lamJobActive
+              ? `Generating LAM portrait ${Math.round(state.lamJob.progress || 0)}%`
+              : state.avatar.captureStatus === 'ready'
+                ? 'Capture package ready'
+                : 'Demo character active';
+  const rigCopy =
+    avatarKind === 'lam'
+      ? {
+          level: 'arkit',
+          title: 'LAM facial animation ready',
+          detail: 'Speech visemes drive the reconstructed ARKit face shapes.',
+        }
+      : avatarKind === 'portrait'
+        ? {
+            level: 'none',
+            title: 'Static portrait',
+            detail: 'Upload a LAM export to animate the reconstructed face.',
+          }
+        : rigReadinessCopy();
   return `
     <div class="editor-heading">
-      <span class="eyebrow">3D Twin</span>
-      <h1>Capture the person. Generate the twin.</h1>
-      <p>Create a person-specific 3D avatar from an approved portrait, then inspect its facial speech rig before publishing.</p>
+      <span class="eyebrow">Twin look</span>
+      <h1>Choose a reconstructed face or interactive 3D twin.</h1>
+      <p>A LAM export animates the person's reconstructed face with ARKit expressions. A plain source photo remains static.</p>
     </div>
+    <section class="editor-panel avatar-mode-panel" aria-labelledby="avatar-mode-heading">
+      <div class="panel-heading">
+        <h2 id="avatar-mode-heading">Published appearance</h2>
+        <p>The selected mode appears on the public twin page.</p>
+      </div>
+      <div class="avatar-mode-switch" role="radiogroup" aria-label="Published twin appearance">
+        <button type="button" role="radio" aria-checked="${state.profile.avatarMode === 'lam'}" data-avatar-mode="lam" ${canUseLam ? '' : 'disabled'}>${icon('face')}<span><strong>LAM portrait</strong><small>Reconstructed Gaussian face</small></span></button>
+        <button type="button" role="radio" aria-checked="${state.profile.avatarMode === '3d'}" data-avatar-mode="3d">${icon('view_in_ar')}<span><strong>Interactive 3D</strong><small>Generated or imported GLB/VRM</small></span></button>
+        <button type="button" role="radio" aria-checked="${state.profile.avatarMode === 'portrait'}" data-avatar-mode="portrait" ${canUsePortrait ? '' : 'disabled'}>${icon('photo_camera')}<span><strong>Static photo</strong><small>Source image, no lip sync</small></span></button>
+      </div>
+    </section>
     <section class="avatar-build-section" aria-labelledby="avatar-build-heading">
       <div class="avatar-build-heading">
         <div>
@@ -654,8 +770,11 @@ function appearancePanel() {
         <span>I confirm that this media depicts me or a person who has explicitly authorized this twin.</span>
       </label>
       <div class="avatar-build-actions">
-        <span class="field-hint">MetaPerson creates the first web-ready model from the selected portrait. The expression video remains private for a future high-fidelity worker.</span>
-        <button class="primary-button" type="button" data-action="generate-3d-twin" ${hasPortrait && hasConsent ? '' : 'disabled'}>${icon('view_in_ar')} Generate 3D twin</button>
+        <span class="field-hint" data-lam-generation>${lamJobActive ? 'Reconstructing the approved portrait on the private GPU worker.' : 'Generate an animated LAM portrait or a customizable 3D avatar.'}</span>
+        <div class="avatar-generation-buttons">
+          <button class="secondary-button" type="button" data-action="generate-lam-twin" ${hasLocalPortrait && hasConsent && !lamJobActive ? '' : 'disabled'}>${icon('face')}<span data-lam-generation-label>${lamJobActive ? `Generating ${Math.round(state.lamJob.progress || 0)}%` : 'Generate LAM portrait'}</span></button>
+          <button class="primary-button" type="button" data-action="generate-3d-twin" ${hasLocalPortrait && hasConsent && !lamJobActive ? '' : 'disabled'}>${icon('view_in_ar')} Create 3D avatar</button>
+        </div>
       </div>
     </section>
     ${
@@ -663,23 +782,23 @@ function appearancePanel() {
         ? `<section class="rig-readiness" data-rig-readiness data-level="${escapeHtml(rigCopy.level)}" aria-live="polite">
             <span class="rig-readiness-icon">${icon('graphic_eq')}</span>
             <div><strong data-rig-title>${escapeHtml(rigCopy.title)}</strong><span data-rig-detail>${escapeHtml(rigCopy.detail)}</span></div>
-            <button class="secondary-button" type="button" data-action="test-lip-sync" ${state.rigReport && state.rigReport.level !== 'none' ? '' : 'disabled'}>${icon('play_arrow')} Test lips</button>
+            <button class="secondary-button" type="button" data-action="test-lip-sync" ${avatarKind === 'lam' || (avatarKind !== 'portrait' && state.rigReport && state.rigReport.level !== 'none') ? '' : 'disabled'}>${icon('play_arrow')} Test lips</button>
           </section>`
         : ''
     }
     <section class="editor-panel" aria-labelledby="appearance-heading">
       <div class="panel-heading">
         <h2 id="appearance-heading">Source media</h2>
-        <p>Front portrait, expression video, or a generated GLB/VRM. Up to 30 MB each.</p>
+        <p>Capture media, GLB/VRM, or a LAM avatar ZIP. LAM archives can be up to 120 MB.</p>
       </div>
       <label class="drop-zone" id="media-drop-zone" for="media-input">
         <span>
           ${icon('upload')}
           <strong>Add capture media or generated model</strong>
-          <small>Images, videos, GLB, and VRM files</small>
+          <small>Images, videos, GLB, VRM, and LAM ZIP files</small>
         </span>
       </label>
-      <input class="media-input" id="media-input" type="file" accept="image/*,video/*,.glb,.vrm,model/gltf-binary" multiple />
+      <input class="media-input" id="media-input" type="file" accept="image/*,video/*,.glb,.vrm,.zip,model/gltf-binary,application/zip" multiple />
       <div class="media-grid" id="media-grid">
         ${state.media.length ? state.media.map(mediaItem).join('') : '<div class="media-empty">No source media yet. The interactive procedural twin remains active.</div>'}
       </div>
@@ -820,6 +939,7 @@ function editorPanel() {
 
 function twinPreview() {
   const avatarKind = activeAvatarKind();
+  const isStaticPortrait = avatarKind === 'portrait';
   return `
     <aside class="preview-column" aria-label="Live twin preview">
       <div class="preview-heading">
@@ -828,10 +948,10 @@ function twinPreview() {
       </div>
       <div class="twin-preview">
         <div class="preview-avatar-wrap twin-stage-wrap">
-          <div class="twin-3d-stage" data-twin-stage role="img" aria-label="Interactive 3D twin preview"></div>
+          <div class="twin-3d-stage" data-twin-stage role="img" aria-label="${isStaticPortrait ? 'Static portrait twin preview' : avatarKind === 'lam' ? 'Animated LAM portrait twin preview' : 'Interactive 3D twin preview'}"></div>
           <div class="twin-stage-tools">
-            <span class="preview-avatar-badge">${avatarKind === 'generated' ? 'Generated 3D' : avatarKind === 'imported' ? 'Imported 3D' : 'Demo character'}</span>
-            <button class="stage-icon-button" type="button" data-action="reset-3d" aria-label="Reset 3D view" title="Reset 3D view">${icon('3d_rotation')}</button>
+            <span class="preview-avatar-badge">${avatarKindLabel(avatarKind)}</span>
+            ${isStaticPortrait ? '' : `<button class="stage-icon-button" type="button" data-action="reset-3d" aria-label="Reset avatar view" title="Reset avatar view">${icon('3d_rotation')}</button>`}
           </div>
         </div>
         <div class="preview-copy">
@@ -839,7 +959,7 @@ function twinPreview() {
           <h3 data-preview="displayName">${escapeHtml(state.profile.displayName)}</h3>
           <p data-preview="headline">${escapeHtml(state.profile.headline)}</p>
           <button class="primary-button" type="button" data-route="profile">${icon('mic')} Talk to my twin</button>
-          <button class="quiet-button preview-edit-avatar" type="button" data-studio-tab="appearance">${icon('view_in_ar')} Edit 3D twin</button>
+          <button class="quiet-button preview-edit-avatar" type="button" data-studio-tab="appearance">${icon('view_in_ar')} Edit twin look</button>
           <div class="preview-url">
             <span data-preview="url">robosa.me/${escapeHtml(state.profile.handle)}</span>
             ${icon('public')}
@@ -909,14 +1029,15 @@ function publicHeader() {
 
 function publicIdentity() {
   const avatarKind = activeAvatarKind();
+  const isStaticPortrait = avatarKind === 'portrait';
   return `
     <section class="public-identity" aria-labelledby="public-name">
       <div class="identity-inner">
         <div class="public-twin-stage-wrap ${state.speaking ? 'is-speaking' : ''}" data-speaking-frame>
-          <div class="twin-3d-stage public-twin-stage" data-twin-stage role="img" aria-label="${escapeHtml(state.profile.displayName)}'s interactive 3D AI representative"></div>
-          <span class="preview-avatar-badge public-avatar-mode-badge">${avatarKind === 'generated' ? 'Generated 3D' : avatarKind === 'imported' ? 'Imported 3D' : 'Demo character'}</span>
+          <div class="twin-3d-stage public-twin-stage" data-twin-stage role="img" aria-label="${escapeHtml(state.profile.displayName)}'s ${isStaticPortrait ? 'static portrait' : avatarKind === 'lam' ? 'animated LAM portrait' : 'interactive 3D'} AI representative"></div>
+          <span class="preview-avatar-badge public-avatar-mode-badge">${avatarKindLabel(avatarKind)}</span>
           <span class="speaking-bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
-          <button class="stage-icon-button public-stage-reset" type="button" data-action="reset-3d" aria-label="Reset 3D view" title="Reset 3D view">${icon('3d_rotation')}</button>
+          ${isStaticPortrait ? '' : `<button class="stage-icon-button public-stage-reset" type="button" data-action="reset-3d" aria-label="Reset avatar view" title="Reset avatar view">${icon('3d_rotation')}</button>`}
         </div>
         <span class="identity-badge">${icon('smart_toy')} AI representative</span>
         <h1 id="public-name">${escapeHtml(state.profile.displayName)}</h1>
@@ -1297,6 +1418,9 @@ function closeMetaPersonDialog() {
 
 function bindMetaPersonEvents() {
   document
+    .querySelector('[data-action="generate-lam-twin"]')
+    ?.addEventListener('click', generateLamTwin);
+  document
     .querySelector('[data-action="generate-3d-twin"]')
     ?.addEventListener('click', async () => {
       const portrait = avatarPortraitRecord();
@@ -1323,6 +1447,69 @@ function bindMetaPersonEvents() {
   document
     .querySelector('[data-action="export-avatar"]')
     ?.addEventListener('click', () => metaPersonCreator.exportAvatar());
+}
+
+function updateLamJobUi() {
+  const active = ['queued', 'running'].includes(state.lamJob?.status);
+  const progress = Math.round(state.lamJob?.progress || 0);
+  const button = document.querySelector('[data-action="generate-lam-twin"]');
+  if (button && active) {
+    button.disabled = true;
+    const label = button.querySelector('[data-lam-generation-label]');
+    if (label) label.textContent = `Generating ${progress}%`;
+  }
+  const status = document.querySelector('[data-lam-generation]');
+  if (status && active) {
+    status.textContent =
+      'Reconstructing the approved portrait on the private GPU worker.';
+  }
+}
+
+async function generateLamTwin() {
+  const portrait = avatarPortraitRecord();
+  if (!portrait || !state.avatar.consentAt || state.lamJob) return;
+  try {
+    const result = await apiRequest('/avatar/lam/jobs', {
+      method: 'POST',
+      headers: {
+        'Content-Type': portrait.blob.type || 'application/octet-stream',
+        'X-Robosa-Consent-At': state.avatar.consentAt,
+      },
+      body: portrait.blob,
+    });
+    state.lamJob = result.job;
+    render();
+    while (['queued', 'running'].includes(state.lamJob.status)) {
+      await new Promise((resolve) => globalThis.setTimeout(resolve, 2000));
+      const status = await apiRequest(
+        `/avatar/lam/jobs/${encodeURIComponent(state.lamJob.id)}`,
+      );
+      state.lamJob = status.job;
+      updateLamJobUi();
+      if (status.profile) {
+        state.profile = saveProfile({
+          ...status.profile,
+          avatarMediaId: state.deviceAvatarMediaId,
+        });
+      }
+    }
+    if (state.lamJob.status !== 'complete') {
+      throw new Error(state.lamJob.error || 'LAM portrait generation failed.');
+    }
+    state.avatar.mode = 'lam';
+    state.avatar.captureStatus = 'ready';
+    state.avatar.capturePreparedAt ||= new Date().toISOString();
+    state.avatar.builtAt = new Date().toISOString();
+    state.avatar.profileHandle = state.profile.handle;
+    state.avatar = saveAvatarConfig(state.avatar);
+    state.rigReport = null;
+    showToast('Animated LAM portrait generated and published.');
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    state.lamJob = null;
+    render();
+  }
 }
 
 function bindVoiceRuntimeEvents() {
@@ -1420,6 +1607,81 @@ async function updateBookingStatus(bookingId, status) {
   }
 }
 
+async function publishPortrait(record) {
+  if (!record || mediaKind(record) !== 'image') {
+    throw new Error('Choose a portrait image first.');
+  }
+  const result = await apiRequest('/avatar/portrait', {
+    method: 'PUT',
+    headers: {
+      'Content-Type': record.blob.type || 'application/octet-stream',
+    },
+    body: record.blob,
+  });
+  state.profile = saveProfile({
+    ...result.profile,
+    avatarMediaId: state.deviceAvatarMediaId,
+  });
+  state.avatar.profileHandle = state.profile.handle;
+  state.avatar = saveAvatarConfig(state.avatar);
+}
+
+async function publishLamAvatar(record) {
+  if (!state.avatar.consentAt) {
+    throw new Error('Confirm consent before publishing this LAM avatar.');
+  }
+  if (!record || mediaKind(record) !== 'lam') {
+    throw new Error('Choose a LAM avatar ZIP first.');
+  }
+  const result = await apiRequest('/avatar/lam', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/zip' },
+    body: record.blob,
+  });
+  state.profile = saveProfile({
+    ...result.profile,
+    avatarMediaId: state.deviceAvatarMediaId,
+  });
+  state.avatar.mode = 'lam';
+  state.avatar.lamMediaId = record.id;
+  state.avatar.profileHandle = state.profile.handle;
+  state.avatar.builtAt = new Date().toISOString();
+  state.avatar = saveAvatarConfig(state.avatar);
+}
+
+async function selectAvatarMode(mode, button) {
+  if (!['portrait', 'lam', '3d'].includes(mode)) return;
+  button.disabled = true;
+  try {
+    if (mode === 'lam') {
+      const archive = lamAvatarRecord();
+      if (archive) await publishLamAvatar(archive);
+      else {
+        state.profile.avatarMode = 'lam';
+        if (!(await saveOwnerProfile({ quiet: true }))) return;
+      }
+      showToast('LAM portrait published with ARKit facial animation.');
+    } else if (mode === 'portrait') {
+      const portrait = avatarPortraitRecord();
+      if (portrait) await publishPortrait(portrait);
+      else {
+        state.profile.avatarMode = 'portrait';
+        if (!(await saveOwnerProfile({ quiet: true }))) return;
+      }
+      showToast('Static portrait published.');
+    } else {
+      state.profile.avatarMode = '3d';
+      if (!(await saveOwnerProfile({ quiet: true }))) return;
+      showToast('Interactive 3D appearance published.');
+    }
+    state.rigReport = null;
+    render();
+  } catch (error) {
+    showToast(error.message);
+    button.disabled = false;
+  }
+}
+
 function bindMediaEvents() {
   const input = document.querySelector('#media-input');
   const dropZone = document.querySelector('#media-drop-zone');
@@ -1441,8 +1703,14 @@ function bindMediaEvents() {
     });
   }
 
+  document.querySelectorAll('[data-avatar-mode]').forEach((button) => {
+    button.addEventListener('click', () =>
+      selectAvatarMode(button.dataset.avatarMode, button),
+    );
+  });
+
   document.querySelectorAll('[data-action="set-avatar"]').forEach((button) => {
-    button.addEventListener('click', () => {
+    button.addEventListener('click', async () => {
       state.profile.avatarMediaId = button.dataset.mediaId;
       state.deviceAvatarMediaId = button.dataset.mediaId;
       state.avatar.portraitMediaId = button.dataset.mediaId;
@@ -1451,7 +1719,16 @@ function bindMediaEvents() {
       state.avatar.capturePreparedAt = '';
       state.avatar = saveAvatarConfig(state.avatar);
       state.profile = saveProfile(state.profile);
-      showToast('3D portrait source updated.');
+      if (state.profile.avatarMode === 'portrait' && state.avatar.consentAt) {
+        try {
+          await publishPortrait(avatarPortraitRecord());
+          showToast('Portrait source updated and published.');
+        } catch (error) {
+          showToast(error.message);
+        }
+      } else {
+        showToast('Portrait source updated.');
+      }
       render();
     });
   });
@@ -1471,15 +1748,37 @@ function bindMediaEvents() {
     });
 
   document
+    .querySelectorAll('[data-action="use-lam-avatar"]')
+    .forEach((button) => {
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        const record = state.media.find(
+          (item) => item.id === button.dataset.mediaId,
+        );
+        try {
+          await publishLamAvatar(record);
+          state.rigReport = null;
+          showToast('LAM avatar uploaded and activated.');
+          render();
+        } catch (error) {
+          showToast(error.message);
+          button.disabled = false;
+        }
+      });
+    });
+
+  document
     .querySelectorAll('[data-action="use-3d-model"]')
     .forEach((button) => {
-      button.addEventListener('click', () => {
+      button.addEventListener('click', async () => {
         state.avatar.modelMediaId = button.dataset.mediaId;
         state.avatar.profileHandle = state.profile.handle;
         state.avatar.mode = 'model';
         state.avatar.builtAt = new Date().toISOString();
         state.rigReport = null;
         state.avatar = saveAvatarConfig(state.avatar);
+        state.profile.avatarMode = '3d';
+        await saveOwnerProfile({ quiet: true });
         showToast('3D model activated. Inspecting its facial rig.');
         render();
       });
@@ -1532,6 +1831,11 @@ function bindMediaEvents() {
           state.avatar.mode = 'procedural';
           state.rigReport = null;
         }
+        if (state.avatar.lamMediaId === id) {
+          state.avatar.lamMediaId = '';
+          if (state.avatar.mode === 'lam') state.avatar.mode = 'procedural';
+          state.rigReport = null;
+        }
         state.avatar.captureStatus = 'draft';
         state.avatar.capturePreparedAt = '';
         state.avatar = saveAvatarConfig(state.avatar);
@@ -1548,16 +1852,19 @@ async function handleMediaFiles(fileList) {
 
   for (const file of files) {
     const isModel = /\.(glb|vrm)$/i.test(file.name);
+    const isLam = /\.zip$/i.test(file.name);
     if (
       !file.type.startsWith('image/') &&
       !file.type.startsWith('video/') &&
-      !isModel
+      !isModel &&
+      !isLam
     ) {
-      showToast(`${file.name} is not an image, video, GLB, or VRM model.`);
+      showToast(`${file.name} is not supported capture or avatar media.`);
       continue;
     }
-    if (file.size > MAX_MEDIA_BYTES) {
-      showToast(`${file.name} is larger than 30 MB.`);
+    const maximumSize = isLam ? MAX_LAM_BYTES : MAX_MEDIA_BYTES;
+    if (file.size > maximumSize) {
+      showToast(`${file.name} is larger than ${isLam ? '120' : '30'} MB.`);
       continue;
     }
     try {
@@ -1573,6 +1880,9 @@ async function handleMediaFiles(fileList) {
       }
       if (!state.avatar.modelMediaId && mediaKind(record) === 'model') {
         state.avatar.modelMediaId = record.id;
+      }
+      if (!state.avatar.lamMediaId && mediaKind(record) === 'lam') {
+        state.avatar.lamMediaId = record.id;
       }
       added += 1;
     } catch {

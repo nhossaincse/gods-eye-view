@@ -81,3 +81,17 @@ test('generated avatar files are isolated by owner and retain exact bytes', asyn
   assert.deepEqual(await files.read('owner-one'), model);
   await assert.rejects(files.read('owner-two'), { code: 'ENOENT' });
 });
+
+test('published portrait files use isolated storage alongside 3D models', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'robosa-portrait-test-'));
+  const files = createAvatarFileStore({ directory });
+  const portrait = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01,
+  ]);
+  const stored = await files.writePortrait('owner-one', portrait);
+
+  assert.equal(stored.size, portrait.length);
+  assert.match(stored.sha256, /^[a-f0-9]{64}$/);
+  assert.deepEqual(await files.readPortrait('owner-one'), portrait);
+  await assert.rejects(files.readPortrait('owner-two'), { code: 'ENOENT' });
+});

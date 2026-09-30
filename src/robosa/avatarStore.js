@@ -5,6 +5,7 @@ export const DEFAULT_AVATAR_CONFIG = Object.freeze({
   portraitMediaId: '',
   referenceVideoId: '',
   modelMediaId: '',
+  lamMediaId: '',
   profileHandle: '',
   consentAt: '',
   captureStatus: 'draft',
@@ -15,12 +16,13 @@ export const DEFAULT_AVATAR_CONFIG = Object.freeze({
 function sanitizeAvatarConfig(candidate) {
   const source = candidate && typeof candidate === 'object' ? candidate : {};
   return {
-    mode: ['model', 'hosted'].includes(source.mode)
+    mode: ['model', 'hosted', 'lam'].includes(source.mode)
       ? source.mode
       : 'procedural',
     portraitMediaId: String(source.portraitMediaId || '').slice(0, 100),
     referenceVideoId: String(source.referenceVideoId || '').slice(0, 100),
     modelMediaId: String(source.modelMediaId || '').slice(0, 100),
+    lamMediaId: String(source.lamMediaId || '').slice(0, 100),
     profileHandle: String(source.profileHandle || '')
       .trim()
       .toLowerCase()
