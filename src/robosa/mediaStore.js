@@ -77,6 +77,14 @@ export async function removeMedia(id) {
 export function mediaKind(record) {
   if (String(record?.type || '').startsWith('image/')) return 'image';
   if (String(record?.type || '').startsWith('video/')) return 'video';
+  if (
+    ['model/gltf-binary', 'model/gltf+json'].includes(
+      String(record?.type || ''),
+    ) ||
+    /\.(glb|gltf|vrm)$/i.test(String(record?.name || ''))
+  ) {
+    return 'model';
+  }
   return 'unknown';
 }
 

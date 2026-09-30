@@ -1,11 +1,28 @@
+import { visemeForText } from './avatarRig.js';
+
+function visemeForCharacter(character) {
+  return visemeForText(character, 0);
+}
+
 export class BrowserVoice {
-  constructor({ onTranscript, onListeningChange, onSpeakingChange, onError }) {
+  constructor({
+    onTranscript,
+    onListeningChange,
+    onSpeakingChange,
+    onViseme,
+    onError,
+  }) {
     this.onTranscript = onTranscript;
     this.onListeningChange = onListeningChange;
     this.onSpeakingChange = onSpeakingChange;
+    this.onViseme = onViseme;
     this.onError = onError;
     this.recognition = null;
     this.listening = false;
+    this.visemeTimer = 0;
+    this.visemeCharacters = [];
+    this.visemeText = '';
+    this.visemeIndex = 0;
 
     const Recognition =
       globalThis.SpeechRecognition || globalThis.webkitSpeechRecognition;
@@ -80,14 +97,47 @@ export class BrowserVoice {
       voices.find((voice) => /^en[-_]/i.test(voice.lang)) ||
       voices[0] ||
       null;
-    utterance.onstart = () => this.onSpeakingChange?.(true);
-    utterance.onend = () => this.onSpeakingChange?.(false);
-    utterance.onerror = () => this.onSpeakingChange?.(false);
+    utterance.onstart = () => {
+      this.onSpeakingChange?.(true);
+      this.startVisemes(String(text));
+    };
+    utterance.onboundary = (event) => {
+      if (Number.isInteger(event.charIndex)) this.visemeIndex = event.charIndex;
+    };
+    utterance.onend = () => {
+      this.stopVisemes();
+      this.onSpeakingChange?.(false);
+    };
+    utterance.onerror = () => {
+      this.stopVisemes();
+      this.onSpeakingChange?.(false);
+    };
     globalThis.speechSynthesis.speak(utterance);
+  }
+
+  startVisemes(text) {
+    this.stopVisemes();
+    this.visemeText = String(text || '').replace(/\s+/g, ' ');
+    this.visemeCharacters = this.visemeText.split('');
+    this.visemeIndex = 0;
+    this.visemeTimer = globalThis.setInterval(() => {
+      const index =
+        this.visemeIndex % Math.max(this.visemeCharacters.length, 1);
+      const viseme = visemeForText(this.visemeText, index);
+      this.onViseme?.(viseme, viseme === 'sil' ? 0.12 : 0.9);
+      this.visemeIndex += 1;
+    }, 72);
+  }
+
+  stopVisemes() {
+    globalThis.clearInterval(this.visemeTimer);
+    this.visemeTimer = 0;
+    this.onViseme?.('sil', 0);
   }
 
   stopSpeaking() {
     globalThis.speechSynthesis?.cancel();
+    this.stopVisemes();
     this.onSpeakingChange?.(false);
   }
 
@@ -96,3 +146,5 @@ export class BrowserVoice {
     this.stopSpeaking();
   }
 }
+
+export { visemeForCharacter };

@@ -1,5 +1,4 @@
 const PROFILE_STORAGE_KEY = 'robosa.profile.v1';
-const BOOKINGS_STORAGE_KEY = 'robosa.booking-requests.v1';
 
 export const DEFAULT_PROFILE = Object.freeze({
   handle: 'nazmul',
@@ -27,7 +26,20 @@ export const DEFAULT_PROFILE = Object.freeze({
   allowBooking: true,
   speakReplies: true,
   visibility: 'public',
+  avatarModel: null,
 });
+
+function sanitizeAvatarModel(value) {
+  if (value?.status !== 'ready' || !value?.url) return null;
+  return {
+    status: 'ready',
+    provider: String(value.provider || '').slice(0, 40),
+    size: Math.max(0, Number(value.size) || 0),
+    rigProfile: String(value.rigProfile || '').slice(0, 40),
+    updatedAt: String(value.updatedAt || '').slice(0, 40),
+    url: String(value.url || '').slice(0, 500),
+  };
+}
 
 function cloneDefaultProfile() {
   return {
@@ -80,7 +92,7 @@ export function projectsToText(projects) {
     .join('\n');
 }
 
-function sanitizeProfile(candidate) {
+export function sanitizeProfile(candidate) {
   const fallback = cloneDefaultProfile();
   const source = candidate && typeof candidate === 'object' ? candidate : {};
   const handle = normalizeHandle(source.handle) || fallback.handle;
@@ -139,6 +151,7 @@ function sanitizeProfile(candidate) {
         ? source.speakReplies
         : fallback.speakReplies,
     visibility,
+    avatarModel: sanitizeAvatarModel(source.avatarModel),
   };
 }
 
@@ -164,46 +177,4 @@ export function saveProfile(profile, storage = globalThis.localStorage) {
   return sanitized;
 }
 
-export function saveBookingRequest(request, storage = globalThis.localStorage) {
-  const booking = {
-    id:
-      globalThis.crypto?.randomUUID?.() ||
-      `booking-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    createdAt: new Date().toISOString(),
-    slot: String(request?.slot || '').slice(0, 120),
-    guestName: String(request?.guestName || '')
-      .trim()
-      .slice(0, 100),
-    guestEmail: String(request?.guestEmail || '')
-      .trim()
-      .slice(0, 180),
-  };
-
-  if (storage) {
-    try {
-      const existing = JSON.parse(
-        storage.getItem(BOOKINGS_STORAGE_KEY) || '[]',
-      );
-      const bookings = Array.isArray(existing) ? existing : [];
-      storage.setItem(
-        BOOKINGS_STORAGE_KEY,
-        JSON.stringify([...bookings.slice(-29), booking]),
-      );
-    } catch {
-      // Booking confirmation remains visible even if persistence is blocked.
-    }
-  }
-  return booking;
-}
-
-export function loadBookingRequests(storage = globalThis.localStorage) {
-  if (!storage) return [];
-  try {
-    const bookings = JSON.parse(storage.getItem(BOOKINGS_STORAGE_KEY) || '[]');
-    return Array.isArray(bookings) ? bookings : [];
-  } catch {
-    return [];
-  }
-}
-
-export { PROFILE_STORAGE_KEY, BOOKINGS_STORAGE_KEY };
+export { PROFILE_STORAGE_KEY };

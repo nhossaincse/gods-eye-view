@@ -1,44 +1,67 @@
 import { BrowserVoice } from './browserVoice.js';
+import { AudioDrivenLipSync } from './audioLipSync.js';
+import { loadAvatarConfig, saveAvatarConfig } from './avatarStore.js';
 import { addMedia, listMedia, mediaKind, removeMedia } from './mediaStore.js';
+import { MetaPersonCreator } from './metaPersonCreator.js';
 import {
-  loadBookingRequests,
   loadProfile,
   normalizeHandle,
   parseLineList,
   parseProjects,
   projectsToText,
-  saveBookingRequest,
   saveProfile,
 } from './profileStore.js';
 import { answerTwin, suggestedQuestions } from './twinBrain.js';
+import { Twin3DStage } from './twin3d.js';
+import {
+  loadVoiceRuntime,
+  OpenLlmVtuberRuntime,
+  saveVoiceRuntime,
+} from './voiceRuntime.js';
 
 const app = document.querySelector('#robosa-app');
 const toast = document.querySelector('#robosa-toast');
 const DEFAULT_AVATAR = '/robosa-twin-default.png';
 const MAX_MEDIA_BYTES = 30 * 1024 * 1024;
+const localProfile = loadProfile();
 
 const STUDIO_TABS = Object.freeze([
   { id: 'identity', label: 'Identity', icon: 'person' },
   { id: 'knowledge', label: 'Knowledge', icon: 'description' },
-  { id: 'appearance', label: 'Appearance', icon: 'photo_camera' },
+  { id: 'appearance', label: '3D Twin', icon: 'view_in_ar' },
+  { id: 'voice', label: 'Voice', icon: 'record_voice_over' },
   { id: 'permissions', label: 'Boundaries', icon: 'shield' },
 ]);
 
 const state = {
-  profile: loadProfile(),
+  profile: localProfile,
+  avatar: loadAvatarConfig(),
+  voiceRuntime: loadVoiceRuntime(),
+  deviceAvatarMediaId: localProfile.avatarMediaId,
+  ownerHandle: '',
   media: [],
   mediaUrls: new Map(),
-  bookings: loadBookingRequests(),
+  bookings: [],
+  authStatus: 'loading',
+  authMode: 'register',
+  owner: null,
+  routeLoading: true,
+  publicFound: true,
+  activeHandle: '',
+  conversationId: '',
   activeStudioTab: 'identity',
   messages: [],
   pendingReply: false,
   listening: false,
   speaking: false,
+  runtimeStatus: 'disconnected',
+  rigReport: null,
   audioEnabled: true,
   selectedSlot: '',
   toastTimer: 0,
 };
 state.audioEnabled = state.profile.speakReplies;
+let twinStage = null;
 
 const voice = new BrowserVoice({
   onTranscript: (transcript) => sendMessage(transcript),
@@ -48,10 +71,133 @@ const voice = new BrowserVoice({
   },
   onSpeakingChange: (speaking) => {
     state.speaking = speaking;
+    twinStage?.setSpeaking(speaking);
     updateVoiceUi();
   },
+  onViseme: (viseme, strength) => twinStage?.setViseme(viseme, strength),
   onError: (message) => showToast(message),
 });
+
+const audioLipSync = new AudioDrivenLipSync({
+  onValue: (viseme, strength) => twinStage?.setVisemeValue(viseme, strength),
+  onError: (message) => showToast(message),
+});
+
+const openLlmRuntime = new OpenLlmVtuberRuntime({
+  onStatus: (status) => {
+    state.runtimeStatus = status;
+    updateRuntimeUi();
+  },
+  onSpeaking: (speaking) => {
+    state.speaking = speaking;
+    twinStage?.setSpeaking(speaking);
+    updateVoiceUi();
+  },
+  onViseme: (viseme, strength) => twinStage?.setViseme(viseme, strength),
+  onError: (message) => showToast(message),
+  audioLipSync,
+});
+
+const metaPersonCreator = new MetaPersonCreator({
+  apiRequest,
+  onState: updateMetaPersonUi,
+  onExport: importGeneratedAvatar,
+});
+
+async function apiRequest(path, options = {}) {
+  const response = await fetch(`/api/robosa${path}`, {
+    credentials: 'same-origin',
+    ...options,
+    headers: {
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      ...options.headers,
+    },
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload?.error?.message || 'Request failed.');
+    error.status = response.status;
+    error.code = payload?.error?.code || 'REQUEST_FAILED';
+    throw error;
+  }
+  return payload;
+}
+
+async function loadOwnerSession() {
+  try {
+    const session = await apiRequest('/session');
+    if (!session.authenticated) {
+      state.authStatus = 'guest';
+      state.owner = null;
+      state.ownerHandle = '';
+      state.bookings = [];
+      return;
+    }
+    state.authStatus = 'owner';
+    state.owner = session.user;
+    state.ownerHandle = session.profile.handle;
+    state.profile = saveProfile({
+      ...session.profile,
+      avatarMediaId: state.deviceAvatarMediaId,
+    });
+    await loadOwnerBookings();
+  } catch (error) {
+    showToast('The Robosa server is unavailable.');
+    state.authStatus = 'guest';
+    state.owner = null;
+    state.bookings = [];
+  }
+}
+
+async function loadOwnerBookings() {
+  if (state.authStatus !== 'owner') return;
+  try {
+    const result = await apiRequest('/bookings');
+    state.bookings = result.bookings || [];
+  } catch {
+    state.bookings = [];
+  }
+}
+
+async function loadPublicProfile(handle) {
+  state.routeLoading = true;
+  state.publicFound = true;
+  render();
+  try {
+    const result = await apiRequest(`/profiles/${encodeURIComponent(handle)}`);
+    state.profile = {
+      ...result.profile,
+      avatarMediaId:
+        state.authStatus === 'owner' &&
+        result.profile.handle === state.ownerHandle
+          ? state.deviceAvatarMediaId
+          : '',
+    };
+    state.publicFound = true;
+    if (state.activeHandle !== handle) {
+      state.messages = [];
+      state.conversationId = '';
+    }
+    state.activeHandle = handle;
+  } catch (error) {
+    state.publicFound = false;
+    if (error.status !== 404) showToast('The public twin could not be loaded.');
+  } finally {
+    state.routeLoading = false;
+  }
+}
+
+async function hydrateRoute() {
+  const route = routeFromLocation();
+  if (route.view === 'studio') {
+    state.routeLoading = true;
+    render();
+    await loadOwnerSession();
+    state.routeLoading = false;
+    return;
+  }
+  await loadPublicProfile(route.handle);
+}
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -76,6 +222,31 @@ function showToast(message) {
   }, 2600);
 }
 
+function runtimeStatusLabel(status = state.runtimeStatus) {
+  return (
+    {
+      connected: 'Runtime connected',
+      connecting: 'Connecting',
+      thinking: 'Generating response',
+      speaking: 'Speaking',
+      error: 'Connection failed',
+    }[status] || 'Runtime disconnected'
+  );
+}
+
+function updateRuntimeUi() {
+  const element = document.querySelector('[data-runtime-status]');
+  if (!element) return;
+  element.dataset.status = state.runtimeStatus;
+  const label = element.querySelector('strong');
+  if (label) label.textContent = runtimeStatusLabel();
+}
+
+function stopAllSpeech() {
+  voice.stopSpeaking();
+  openLlmRuntime.interrupt();
+}
+
 function mediaUrl(record) {
   if (!record) return '';
   if (!state.mediaUrls.has(record.id)) {
@@ -91,6 +262,125 @@ function avatarUrl() {
       mediaKind(record) === 'image',
   );
   return avatar ? mediaUrl(avatar) : DEFAULT_AVATAR;
+}
+
+function avatarPortraitRecord() {
+  const portraitId =
+    state.avatar.portraitMediaId || state.profile.avatarMediaId;
+  return state.media.find(
+    (record) => record.id === portraitId && mediaKind(record) === 'image',
+  );
+}
+
+function avatarModelRecord() {
+  return state.media.find(
+    (record) =>
+      record.id === state.avatar.modelMediaId && mediaKind(record) === 'model',
+  );
+}
+
+function hostedAvatarModel() {
+  return state.profile.avatarModel?.status === 'ready'
+    ? state.profile.avatarModel
+    : null;
+}
+
+function activeAvatarKind() {
+  const localAvatarApplies =
+    routeFromLocation().view === 'studio' ||
+    state.avatar.profileHandle === state.profile.handle;
+  if (
+    localAvatarApplies &&
+    state.avatar.mode === 'model' &&
+    avatarModelRecord()
+  ) {
+    return 'imported';
+  }
+  if (hostedAvatarModel()) return 'generated';
+  return 'demo';
+}
+
+function mountTwinStage() {
+  const container = document.querySelector('[data-twin-stage]');
+  if (!container) return;
+  const localAvatarApplies =
+    routeFromLocation().view === 'studio' ||
+    state.avatar.profileHandle === state.profile.handle;
+  const model = localAvatarApplies ? avatarModelRecord() : null;
+  const localModelActive = state.avatar.mode === 'model' && model;
+  const generatedModel = hostedAvatarModel();
+  twinStage = new Twin3DStage(container, {
+    modelUrl: localModelActive
+      ? mediaUrl(model)
+      : generatedModel?.url || '/robosa-default.glb',
+    onModelError: showToast,
+    onModelReady: (report) => {
+      state.rigReport = report;
+      updateRigReadiness();
+    },
+  });
+  twinStage.setSpeaking(state.speaking);
+  document
+    .querySelectorAll('[data-action="reset-3d"]')
+    .forEach((button) =>
+      button.addEventListener('click', () => twinStage?.resetCamera()),
+    );
+}
+
+function rigReadinessCopy(report = state.rigReport) {
+  if (!report) {
+    return {
+      level: 'checking',
+      title: 'Inspecting facial rig',
+      detail: 'Checking morph targets and VRM expressions.',
+    };
+  }
+  if (report.level === 'full') {
+    return {
+      level: report.level,
+      title: 'Full lip sync ready',
+      detail: `${report.oculusCount}/14 Oculus speech shapes detected.`,
+    };
+  }
+  if (report.level === 'vrm') {
+    return {
+      level: report.level,
+      title: 'VRM lip sync ready',
+      detail: 'The aa, ih, ou, ee, and oh expressions are available.',
+    };
+  }
+  if (report.level === 'basic') {
+    return {
+      level: report.level,
+      title: 'Basic mouth animation only',
+      detail:
+        'Add Oculus visemes or VRM vowel expressions for accurate speech.',
+    };
+  }
+  return {
+    level: report.level,
+    title: 'No facial speech rig detected',
+    detail: 'This model can render, but its mouth cannot follow speech yet.',
+  };
+}
+
+function updateRigReadiness() {
+  const container = document.querySelector('[data-rig-readiness]');
+  if (!container) return;
+  const copy = rigReadinessCopy();
+  container.dataset.level = copy.level;
+  const title = container.querySelector('[data-rig-title]');
+  const detail = container.querySelector('[data-rig-detail]');
+  const test = container.querySelector('[data-action="test-lip-sync"]');
+  if (title) title.textContent = copy.title;
+  if (detail) detail.textContent = copy.detail;
+  if (test)
+    test.disabled = !state.rigReport || state.rigReport.level === 'none';
+}
+
+function disposeTwinStage() {
+  twinStage?.dispose();
+  twinStage = null;
 }
 
 function routeFromLocation() {
@@ -111,10 +401,71 @@ function routeFromLocation() {
   return { view: 'profile', handle: normalizeHandle(path) };
 }
 
-function navigateTo(path) {
+async function navigateTo(path) {
   window.history.pushState({}, '', path);
-  voice.stopSpeaking();
+  stopAllSpeech();
+  await hydrateRoute();
   render();
+}
+
+function loadingTemplate() {
+  return `
+    <main class="loading-shell" aria-live="polite">
+      <span class="brand-mark">R</span>
+      <div class="typing-bubble" aria-label="Loading Robosa"><i></i><i></i><i></i></div>
+    </main>`;
+}
+
+function authTemplate() {
+  const registering = state.authMode === 'register';
+  return `
+    <main class="auth-shell">
+      <header class="auth-header">
+        <a class="brand" href="/studio" aria-label="Robosa twin studio">
+          <span class="brand-mark">R</span>
+          <span>robosa<span class="brand-domain">.me</span></span>
+        </a>
+        <a class="secondary-button" href="/${escapeHtml(state.profile.handle)}">${icon('public')} View public twin</a>
+      </header>
+      <section class="auth-workspace" aria-labelledby="auth-title">
+        <div class="auth-context">
+          <span class="eyebrow">Owner access</span>
+          <h1 id="auth-title">${registering ? 'Claim your twin.' : 'Welcome back.'}</h1>
+          <p>${registering ? 'Create the owner account for your public profile and approval inbox.' : 'Sign in to manage your twin and meeting requests.'}</p>
+          <div class="auth-preview">
+            <img src="${escapeHtml(avatarUrl())}" alt="Twin portrait preview" />
+            <div><strong>${escapeHtml(state.profile.displayName)}</strong><span>robosa.me/${escapeHtml(state.profile.handle)}</span></div>
+          </div>
+        </div>
+        <div class="auth-form-wrap">
+          <div class="auth-tabs" role="tablist" aria-label="Owner access mode">
+            <button type="button" role="tab" aria-selected="${registering}" data-auth-mode="register">Create account</button>
+            <button type="button" role="tab" aria-selected="${!registering}" data-auth-mode="login">Sign in</button>
+          </div>
+          <form class="auth-form" id="auth-form">
+            ${
+              registering
+                ? `<label class="form-field">
+                    <span class="field-label">Public handle</span>
+                    <span class="handle-input"><span>robosa.me/</span><input name="handle" required minlength="2" maxlength="40" value="${escapeHtml(state.profile.handle)}" /></span>
+                  </label>`
+                : ''
+            }
+            <label class="form-field">
+              <span class="field-label">Email</span>
+              <input name="email" type="email" autocomplete="email" required maxlength="180" />
+            </label>
+            <label class="form-field">
+              <span class="field-label">Password</span>
+              <input name="password" type="password" autocomplete="${registering ? 'new-password' : 'current-password'}" required minlength="10" maxlength="256" />
+              ${registering ? '<span class="field-hint">At least 10 characters</span>' : ''}
+            </label>
+            <button class="primary-button auth-submit" type="submit">${registering ? 'Create owner account' : 'Sign in'} ${icon('arrow_forward')}</button>
+            <p class="auth-note">${icon('lock')} Your password is hashed on the server. Email verification is not active in this local milestone.</p>
+          </form>
+        </div>
+      </section>
+    </main>`;
 }
 
 function studioHeader() {
@@ -129,9 +480,12 @@ function studioHeader() {
         <button class="header-tab" type="button" role="tab" aria-selected="false" data-route="profile">Public twin</button>
       </div>
       <div class="header-actions">
-        <span class="save-state">Saved locally</span>
+        <span class="save-state">Saved to account</span>
         <button class="secondary-button" type="button" data-action="copy-link">
           ${icon('content_copy')}<span>Copy link</span>
+        </button>
+        <button class="icon-button" type="button" data-action="logout" aria-label="Sign out" title="Sign out">
+          ${icon('logout')}
         </button>
         <button class="primary-button" type="button" data-route="profile">
           <span>Preview</span>${icon('arrow_forward')}
@@ -159,7 +513,7 @@ function studioSidebar() {
             </button>`,
         ).join('')}
       </nav>
-      <p class="sidebar-footnote">Prototype data stays in this browser. Nothing is uploaded to a server.</p>
+      <p class="sidebar-footnote">Profile and requests are saved to your owner account. Source media stays on this device.</p>
     </aside>`;
 }
 
@@ -229,19 +583,27 @@ function knowledgePanel() {
 function mediaItem(record) {
   const kind = mediaKind(record);
   const url = mediaUrl(record);
-  const isAvatar = state.profile.avatarMediaId === record.id;
-  const media =
-    kind === 'image'
-      ? `<img src="${escapeHtml(url)}" alt="${escapeHtml(record.name)}" />`
-      : `<video src="${escapeHtml(url)}" aria-label="${escapeHtml(record.name)}" muted playsinline preload="metadata"></video>`;
+  const isAvatar = state.avatar.portraitMediaId === record.id;
+  const isReference = state.avatar.referenceVideoId === record.id;
+  const isModel =
+    state.avatar.mode === 'model' && state.avatar.modelMediaId === record.id;
+  const modelFormat = /\.vrm$/i.test(record.name) ? 'VRM' : 'GLB';
+  let media = `<div class="model-media-preview">${icon('view_in_ar')}<span>${modelFormat}</span></div>`;
+  if (kind === 'image') {
+    media = `<img src="${escapeHtml(url)}" alt="${escapeHtml(record.name)}" />`;
+  } else if (kind === 'video') {
+    media = `<video src="${escapeHtml(url)}" aria-label="${escapeHtml(record.name)}" muted playsinline preload="metadata"></video>`;
+  }
   return `
     <article class="media-item" data-media-id="${escapeHtml(record.id)}">
       ${media}
       <div class="media-item-actions">
         ${
           kind === 'image'
-            ? `<button class="media-action" type="button" data-action="set-avatar" data-media-id="${escapeHtml(record.id)}" ${isAvatar ? 'disabled' : ''} title="${isAvatar ? 'Current avatar' : 'Use as avatar'}" aria-label="${isAvatar ? 'Current avatar' : `Use ${escapeHtml(record.name)} as avatar`}">${isAvatar ? icon('check') : icon('person')}</button>`
-            : `<span class="media-action" title="Speaking video">${icon('video_library')}</span>`
+            ? `<button class="media-action" type="button" data-action="set-avatar" data-media-id="${escapeHtml(record.id)}" ${isAvatar ? 'disabled' : ''} title="${isAvatar ? 'Selected portrait' : 'Use as portrait'}" aria-label="${isAvatar ? 'Selected portrait' : `Use ${escapeHtml(record.name)} as portrait`}">${isAvatar ? icon('check') : icon('person')}</button>`
+            : kind === 'video'
+              ? `<button class="media-action" type="button" data-action="set-reference-video" data-media-id="${escapeHtml(record.id)}" ${isReference ? 'disabled' : ''} title="${isReference ? 'Selected reference video' : 'Use as reference video'}" aria-label="${isReference ? 'Selected reference video' : `Use ${escapeHtml(record.name)} as reference video`}">${isReference ? icon('check') : icon('video_library')}</button>`
+              : `<button class="media-action" type="button" data-action="use-3d-model" data-media-id="${escapeHtml(record.id)}" ${isModel ? 'disabled' : ''} title="${isModel ? 'Active 3D model' : 'Use 3D model'}" aria-label="${isModel ? 'Active 3D model' : `Use ${escapeHtml(record.name)} as 3D model`}">${isModel ? icon('check') : icon('view_in_ar')}</button>`
         }
         <button class="media-action" type="button" data-action="remove-media" data-media-id="${escapeHtml(record.id)}" title="Remove" aria-label="Remove ${escapeHtml(record.name)}">${icon('delete')}</button>
       </div>
@@ -249,28 +611,115 @@ function mediaItem(record) {
 }
 
 function appearancePanel() {
+  const hasPortrait = Boolean(avatarPortraitRecord());
+  const hasVideo = Boolean(
+    state.media.find(
+      (record) =>
+        record.id === state.avatar.referenceVideoId &&
+        mediaKind(record) === 'video',
+    ),
+  );
+  const hasConsent = Boolean(state.avatar.consentAt);
+  const avatarKind = activeAvatarKind();
+  const status =
+    avatarKind === 'generated'
+      ? 'Generated 3D twin active'
+      : avatarKind === 'imported'
+        ? 'Imported 3D model active'
+        : state.avatar.captureStatus === 'ready'
+          ? 'Capture package ready'
+          : 'Demo character active';
+  const rigCopy = rigReadinessCopy();
   return `
     <div class="editor-heading">
-      <span class="eyebrow">Appearance</span>
-      <h1>Add the face and source material.</h1>
-      <p>Photos can become the public portrait. Speaking videos are stored as future avatar-training material in this prototype.</p>
+      <span class="eyebrow">3D Twin</span>
+      <h1>Capture the person. Generate the twin.</h1>
+      <p>Create a person-specific 3D avatar from an approved portrait, then inspect its facial speech rig before publishing.</p>
     </div>
+    <section class="avatar-build-section" aria-labelledby="avatar-build-heading">
+      <div class="avatar-build-heading">
+        <div>
+          <span class="avatar-state-dot"></span>
+          <strong id="avatar-build-heading">${status}</strong>
+        </div>
+        ${state.avatar.builtAt ? `<span>Updated ${escapeHtml(new Date(state.avatar.builtAt).toLocaleDateString())}</span>` : state.avatar.capturePreparedAt ? `<span>Prepared ${escapeHtml(new Date(state.avatar.capturePreparedAt).toLocaleDateString())}</span>` : ''}
+      </div>
+      <div class="avatar-build-flow">
+        <div class="avatar-build-step ${hasPortrait ? 'complete' : ''}"><span>1</span><div><strong>Front portrait</strong><small>${hasPortrait ? 'Selected' : 'Neutral, evenly lit'}</small></div></div>
+        <div class="avatar-build-step ${hasVideo ? 'complete' : ''}"><span>2</span><div><strong>Expression video</strong><small>${hasVideo ? 'Selected for capture record' : 'Optional for this generator'}</small></div></div>
+        <div class="avatar-build-step ${hasConsent ? 'complete' : ''}"><span>3</span><div><strong>Consent</strong><small>${hasConsent ? 'Recorded on this device' : 'Required for processing'}</small></div></div>
+      </div>
+      <label class="consent-row">
+        <input id="avatar-consent" type="checkbox" ${hasConsent ? 'checked' : ''} />
+        <span>I confirm that this media depicts me or a person who has explicitly authorized this twin.</span>
+      </label>
+      <div class="avatar-build-actions">
+        <span class="field-hint">MetaPerson creates the first web-ready model from the selected portrait. The expression video remains private for a future high-fidelity worker.</span>
+        <button class="primary-button" type="button" data-action="generate-3d-twin" ${hasPortrait && hasConsent ? '' : 'disabled'}>${icon('view_in_ar')} Generate 3D twin</button>
+      </div>
+    </section>
+    ${
+      avatarKind !== 'demo'
+        ? `<section class="rig-readiness" data-rig-readiness data-level="${escapeHtml(rigCopy.level)}" aria-live="polite">
+            <span class="rig-readiness-icon">${icon('graphic_eq')}</span>
+            <div><strong data-rig-title>${escapeHtml(rigCopy.title)}</strong><span data-rig-detail>${escapeHtml(rigCopy.detail)}</span></div>
+            <button class="secondary-button" type="button" data-action="test-lip-sync" ${state.rigReport && state.rigReport.level !== 'none' ? '' : 'disabled'}>${icon('play_arrow')} Test lips</button>
+          </section>`
+        : ''
+    }
     <section class="editor-panel" aria-labelledby="appearance-heading">
       <div class="panel-heading">
         <h2 id="appearance-heading">Source media</h2>
-        <p>Images and video, up to 30 MB each. Stored locally in IndexedDB.</p>
+        <p>Front portrait, expression video, or a generated GLB/VRM. Up to 30 MB each.</p>
       </div>
       <label class="drop-zone" id="media-drop-zone" for="media-input">
         <span>
           ${icon('upload')}
-          <strong>Add photos or speaking videos</strong>
-          <small>Choose files or drop them here</small>
+          <strong>Add capture media or generated model</strong>
+          <small>Images, videos, GLB, and VRM files</small>
         </span>
       </label>
-      <input class="media-input" id="media-input" type="file" accept="image/*,video/*" multiple />
+      <input class="media-input" id="media-input" type="file" accept="image/*,video/*,.glb,.vrm,model/gltf-binary" multiple />
       <div class="media-grid" id="media-grid">
-        ${state.media.length ? state.media.map(mediaItem).join('') : '<div class="media-empty">No owner media added yet. The synthetic default remains active.</div>'}
+        ${state.media.length ? state.media.map(mediaItem).join('') : '<div class="media-empty">No source media yet. The interactive procedural twin remains active.</div>'}
       </div>
+    </section>`;
+}
+
+function voicePanel() {
+  const external = state.voiceRuntime.mode === 'open-llm-vtuber';
+  return `
+    <div class="editor-heading">
+      <span class="eyebrow">Voice</span>
+      <h1>Choose the conversation runtime.</h1>
+      <p>Use Robosa's grounded conversation by default, or connect a self-hosted Open-LLM-VTuber WebSocket for its configured local agent, speech, and interruption pipeline.</p>
+    </div>
+    <section class="editor-panel" aria-labelledby="voice-runtime-heading">
+      <div class="panel-heading">
+        <h2 id="voice-runtime-heading">Runtime</h2>
+        <p>The selection is stored on this device.</p>
+      </div>
+      <div class="runtime-options" role="radiogroup" aria-label="Conversation runtime">
+        <label class="runtime-option ${external ? '' : 'selected'}">
+          <input type="radio" name="voiceRuntime" value="robosa" ${external ? '' : 'checked'} />
+          <span>${icon('shield')}<strong>Robosa grounded</strong><small>Owner-approved profile and browser voice</small></span>
+        </label>
+        <label class="runtime-option ${external ? 'selected' : ''}">
+          <input type="radio" name="voiceRuntime" value="open-llm-vtuber" ${external ? 'checked' : ''} />
+          <span>${icon('graphic_eq')}<strong>Open-LLM-VTuber</strong><small>Self-hosted agent, TTS, and audio streaming</small></span>
+        </label>
+      </div>
+      <div class="runtime-connection ${external ? '' : 'is-disabled'}">
+        <label class="form-field">
+          <span class="field-label">WebSocket endpoint</span>
+          <input id="voice-runtime-endpoint" type="url" value="${escapeHtml(state.voiceRuntime.endpoint)}" ${external ? '' : 'disabled'} />
+        </label>
+        <button class="secondary-button" type="button" data-action="test-runtime" ${external ? '' : 'disabled'}>${icon('graphic_eq')} Test connection</button>
+      </div>
+      <div class="runtime-status" data-runtime-status data-status="${escapeHtml(state.runtimeStatus)}">
+        <span></span><strong>${escapeHtml(runtimeStatusLabel())}</strong>
+      </div>
+      <p class="runtime-note">Open-LLM-VTuber mode uses the character and knowledge configured on that runtime. Robosa's public profile safeguards apply only in grounded mode.</p>
     </section>`;
 }
 
@@ -279,16 +728,22 @@ function bookingRequestList() {
     return '<div class="media-empty">No meeting requests yet.</div>';
   }
   return state.bookings
-    .slice(-3)
-    .reverse()
+    .slice(0, 8)
     .map(
       (booking) => `
-        <div class="permission-row">
+        <div class="permission-row booking-review-row">
           <div class="permission-copy">
             <strong>${escapeHtml(booking.guestName || 'Guest')} &middot; ${escapeHtml(booking.slot)}</strong>
-            <span>${escapeHtml(booking.guestEmail)} &middot; saved in this browser</span>
+            <span>${escapeHtml(booking.guestEmail)} &middot; <b class="booking-status ${escapeHtml(booking.status)}">${escapeHtml(booking.status)}</b></span>
           </div>
-          ${icon('schedule')}
+          ${
+            booking.status === 'pending'
+              ? `<div class="booking-actions">
+                  <button class="quiet-button" type="button" data-booking-status="declined" data-booking-id="${escapeHtml(booking.id)}">Decline</button>
+                  <button class="primary-button" type="button" data-booking-status="approved" data-booking-id="${escapeHtml(booking.id)}">${icon('check')} Approve</button>
+                </div>`
+              : icon(booking.status === 'approved' ? 'check' : 'close')
+          }
         </div>`,
     )
     .join('');
@@ -304,7 +759,7 @@ function permissionsPanel() {
     <section class="editor-panel" aria-labelledby="permissions-heading">
       <div class="panel-heading">
         <h2 id="permissions-heading">Public permissions</h2>
-        <p>These controls apply immediately to the local public preview.</p>
+        <p>Save changes to update the public twin.</p>
       </div>
       <div class="form-grid">
         <label class="form-field full">
@@ -342,7 +797,7 @@ function permissionsPanel() {
     <section class="editor-panel" aria-labelledby="requests-heading" style="margin-top: 38px">
       <div class="panel-heading">
         <h2 id="requests-heading">Recent requests</h2>
-        <p>${state.bookings.length} saved locally</p>
+        <p>${state.bookings.filter((booking) => booking.status === 'pending').length} awaiting review</p>
       </div>
       <div class="permission-list">${bookingRequestList()}</div>
     </section>`;
@@ -354,6 +809,8 @@ function editorPanel() {
       return knowledgePanel();
     case 'appearance':
       return appearancePanel();
+    case 'voice':
+      return voicePanel();
     case 'permissions':
       return permissionsPanel();
     default:
@@ -362,6 +819,7 @@ function editorPanel() {
 }
 
 function twinPreview() {
+  const avatarKind = activeAvatarKind();
   return `
     <aside class="preview-column" aria-label="Live twin preview">
       <div class="preview-heading">
@@ -369,15 +827,19 @@ function twinPreview() {
         <span class="preview-status">Ready to talk</span>
       </div>
       <div class="twin-preview">
-        <div class="preview-avatar-wrap">
-          <img class="preview-avatar" data-preview="avatar" src="${escapeHtml(avatarUrl())}" alt="Twin portrait preview" />
-          <span class="preview-avatar-badge">AI representative</span>
+        <div class="preview-avatar-wrap twin-stage-wrap">
+          <div class="twin-3d-stage" data-twin-stage role="img" aria-label="Interactive 3D twin preview"></div>
+          <div class="twin-stage-tools">
+            <span class="preview-avatar-badge">${avatarKind === 'generated' ? 'Generated 3D' : avatarKind === 'imported' ? 'Imported 3D' : 'Demo character'}</span>
+            <button class="stage-icon-button" type="button" data-action="reset-3d" aria-label="Reset 3D view" title="Reset 3D view">${icon('3d_rotation')}</button>
+          </div>
         </div>
         <div class="preview-copy">
           <span class="section-kicker">Meet the twin</span>
           <h3 data-preview="displayName">${escapeHtml(state.profile.displayName)}</h3>
           <p data-preview="headline">${escapeHtml(state.profile.headline)}</p>
           <button class="primary-button" type="button" data-route="profile">${icon('mic')} Talk to my twin</button>
+          <button class="quiet-button preview-edit-avatar" type="button" data-studio-tab="appearance">${icon('view_in_ar')} Edit 3D twin</button>
           <div class="preview-url">
             <span data-preview="url">robosa.me/${escapeHtml(state.profile.handle)}</span>
             ${icon('public')}
@@ -396,7 +858,7 @@ function studioTemplate() {
         <form class="editor-column" id="studio-form">
           ${editorPanel()}
           <div class="editor-actions">
-            <span class="field-hint">Owner-controlled prototype</span>
+            <span class="field-hint">Owner-controlled twin</span>
             <div class="editor-actions-right">
               <button class="secondary-button" type="button" data-action="save-profile">Save changes</button>
               <button class="primary-button" type="button" data-route="profile">Publish preview ${icon('arrow_forward')}</button>
@@ -405,7 +867,30 @@ function studioTemplate() {
         </form>
         ${twinPreview()}
       </div>
-    </main>`;
+    </main>
+    ${metaPersonDialog()}`;
+}
+
+function metaPersonDialog() {
+  return `
+    <dialog class="avatar-creator-dialog" id="avatar-creator-dialog">
+      <div class="avatar-creator-header">
+        <div>
+          <span class="section-kicker">3D generation</span>
+          <h2>Create your 3D twin</h2>
+        </div>
+        <button class="icon-button small" type="button" data-action="close-avatar-creator" aria-label="Close 3D twin creator">${icon('close')}</button>
+      </div>
+      <div class="avatar-creator-status" data-avatar-creator-status data-status="loading" aria-live="polite">
+        <span class="avatar-state-dot"></span>
+        <strong>Loading creator</strong>
+      </div>
+      <iframe class="avatar-creator-frame" id="avatar-creator-frame" title="MetaPerson 3D avatar creator" allow="fullscreen"></iframe>
+      <div class="avatar-creator-actions">
+        <span>Owner-approved portrait</span>
+        <button class="primary-button" type="button" data-action="export-avatar" disabled>${icon('download')} Export and use</button>
+      </div>
+    </dialog>`;
 }
 
 function publicHeader() {
@@ -423,12 +908,15 @@ function publicHeader() {
 }
 
 function publicIdentity() {
+  const avatarKind = activeAvatarKind();
   return `
     <section class="public-identity" aria-labelledby="public-name">
       <div class="identity-inner">
-        <div class="public-avatar-frame ${state.speaking ? 'is-speaking' : ''}" data-speaking-frame>
-          <img class="public-avatar" src="${escapeHtml(avatarUrl())}" alt="${escapeHtml(state.profile.displayName)}'s AI representative" />
+        <div class="public-twin-stage-wrap ${state.speaking ? 'is-speaking' : ''}" data-speaking-frame>
+          <div class="twin-3d-stage public-twin-stage" data-twin-stage role="img" aria-label="${escapeHtml(state.profile.displayName)}'s interactive 3D AI representative"></div>
+          <span class="preview-avatar-badge public-avatar-mode-badge">${avatarKind === 'generated' ? 'Generated 3D' : avatarKind === 'imported' ? 'Imported 3D' : 'Demo character'}</span>
           <span class="speaking-bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <button class="stage-icon-button public-stage-reset" type="button" data-action="reset-3d" aria-label="Reset 3D view" title="Reset 3D view">${icon('3d_rotation')}</button>
         </div>
         <span class="identity-badge">${icon('smart_toy')} AI representative</span>
         <h1 id="public-name">${escapeHtml(state.profile.displayName)}</h1>
@@ -493,7 +981,7 @@ function bookingDialog() {
           <span class="field-label">Email</span>
           <input name="guestEmail" type="email" autocomplete="email" required maxlength="180" />
         </label>
-        <p class="dialog-note">Prototype only: this request is saved in your browser. No calendar invitation or email is sent.</p>
+        <p class="dialog-note">This request goes to the owner's approval inbox. It does not create a calendar event yet.</p>
         <div class="dialog-actions">
           <button class="secondary-button" type="button" data-action="close-booking">Cancel</button>
           <button class="primary-button" type="submit" ${state.selectedSlot ? '' : 'disabled'}>Send request ${icon('arrow_forward')}</button>
@@ -504,6 +992,7 @@ function bookingDialog() {
 
 function publicConversation() {
   const questions = suggestedQuestions(state.profile);
+  const externalRuntime = state.voiceRuntime.mode === 'open-llm-vtuber';
   return `
     <section class="public-conversation" aria-label="Talk to the twin">
       <div class="conversation-header">
@@ -511,7 +1000,7 @@ function publicConversation() {
           <span class="conversation-icon">${icon('graphic_eq')}</span>
           <span>
             <strong>Conversation</strong>
-            <span>Answers from owner-approved knowledge</span>
+            <span>${externalRuntime ? 'Open-LLM-VTuber runtime' : 'Answers from owner-approved knowledge'}</span>
           </span>
         </div>
         <div class="conversation-tools">
@@ -559,7 +1048,7 @@ function notFoundTemplate(handle) {
       <div class="not-found-inner">
         <span class="not-found-code">robosa.me/${escapeHtml(handle || 'unknown')}</span>
         <h1>This twin is not here yet.</h1>
-        <p>The local prototype currently contains one owner profile. Open the studio to create or rename it.</p>
+        <p>The handle may be unclaimed, renamed, or private.</p>
         <button class="primary-button" type="button" data-route="studio">${icon('arrow_back')} Open twin studio</button>
       </div>
     </main>`;
@@ -574,15 +1063,26 @@ function ensureWelcomeMessage() {
 }
 
 function render() {
+  disposeTwinStage();
   const route = routeFromLocation();
+  if (state.routeLoading) {
+    app.innerHTML = loadingTemplate();
+    return;
+  }
   if (route.view === 'studio') {
     document.title = 'Robosa.me - Digital twin studio';
+    if (state.authStatus !== 'owner') {
+      app.innerHTML = authTemplate();
+      bindAuthEvents();
+      return;
+    }
     app.innerHTML = studioTemplate();
     bindStudioEvents();
+    mountTwinStage();
     return;
   }
 
-  if (route.handle !== state.profile.handle) {
+  if (!state.publicFound) {
     document.title = 'Twin not found - Robosa.me';
     app.innerHTML = notFoundTemplate(route.handle);
     bindRouteEvents();
@@ -593,17 +1093,73 @@ function render() {
   document.title = `${state.profile.displayName}'s AI twin - Robosa.me`;
   app.innerHTML = publicTemplate();
   bindPublicEvents();
+  mountTwinStage();
   window.requestAnimationFrame(scrollMessagesToEnd);
 }
 
 function bindRouteEvents() {
   document.querySelectorAll('[data-route]').forEach((element) => {
-    element.addEventListener('click', (event) => {
+    element.addEventListener('click', async (event) => {
       event.preventDefault();
       const route = element.dataset.route;
-      navigateTo(route === 'studio' ? '/studio' : `/${state.profile.handle}`);
+      if (
+        route === 'profile' &&
+        routeFromLocation().view === 'studio' &&
+        state.authStatus === 'owner'
+      ) {
+        const saved = await saveOwnerProfile({ quiet: true });
+        if (!saved) return;
+      }
+      await navigateTo(
+        route === 'studio' ? '/studio' : `/${state.profile.handle}`,
+      );
     });
   });
+}
+
+function bindAuthEvents() {
+  document.querySelectorAll('[data-auth-mode]').forEach((button) => {
+    button.addEventListener('click', () => {
+      state.authMode = button.dataset.authMode;
+      render();
+    });
+  });
+  document.querySelector('#auth-form')?.addEventListener('submit', submitAuth);
+}
+
+async function submitAuth(event) {
+  event.preventDefault();
+  const submit = event.currentTarget.querySelector('[type="submit"]');
+  const form = new FormData(event.currentTarget);
+  submit.disabled = true;
+  try {
+    const registering = state.authMode === 'register';
+    const payload = await apiRequest(
+      registering ? '/auth/register' : '/auth/login',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          email: form.get('email'),
+          password: form.get('password'),
+          handle: form.get('handle'),
+          profile: registering ? state.profile : undefined,
+        }),
+      },
+    );
+    state.authStatus = 'owner';
+    state.owner = payload.user;
+    state.ownerHandle = payload.profile.handle;
+    state.profile = saveProfile({
+      ...payload.profile,
+      avatarMediaId: state.deviceAvatarMediaId,
+    });
+    await loadOwnerBookings();
+    showToast(registering ? 'Owner account created.' : 'Signed in.');
+    render();
+  } catch (error) {
+    showToast(error.message);
+    submit.disabled = false;
+  }
 }
 
 function updateProfileField(element) {
@@ -656,16 +1212,212 @@ function bindStudioEvents() {
     .querySelectorAll('[data-action="save-profile"]')
     .forEach((button) => {
       button.addEventListener('click', () => {
-        state.profile = saveProfile(state.profile);
-        showToast('Twin changes saved locally.');
+        saveOwnerProfile();
       });
     });
+
+  document
+    .querySelector('[data-action="logout"]')
+    ?.addEventListener('click', logoutOwner);
+
+  document.querySelectorAll('[data-booking-status]').forEach((button) => {
+    button.addEventListener('click', () =>
+      updateBookingStatus(
+        button.dataset.bookingId,
+        button.dataset.bookingStatus,
+      ),
+    );
+  });
 
   document.querySelectorAll('[data-action="copy-link"]').forEach((button) => {
     button.addEventListener('click', copyShareLink);
   });
 
   bindMediaEvents();
+  bindMetaPersonEvents();
+  bindVoiceRuntimeEvents();
+}
+
+function metaPersonStatusLabel(status) {
+  return (
+    {
+      loading: 'Loading creator',
+      authenticating: 'Connecting securely',
+      generating: 'Generating your avatar',
+      customizing: 'Avatar ready to customize',
+      exporting: 'Exporting facially rigged GLB',
+      importing: 'Saving your generated twin',
+      complete: '3D twin ready',
+      error: 'Generation needs attention',
+    }[status] || 'Preparing creator'
+  );
+}
+
+function updateMetaPersonUi({ status, exportReady, error = '' }) {
+  const statusElement = document.querySelector('[data-avatar-creator-status]');
+  if (statusElement) {
+    statusElement.dataset.status = status;
+    const label = statusElement.querySelector('strong');
+    if (label) label.textContent = metaPersonStatusLabel(status);
+  }
+  const exportButton = document.querySelector('[data-action="export-avatar"]');
+  if (exportButton) exportButton.disabled = !exportReady;
+  if (error) showToast(error);
+  if (status === 'complete') {
+    metaPersonCreator.close();
+    document.querySelector('#avatar-creator-dialog')?.close();
+    showToast('Generated 3D twin saved and activated.');
+    render();
+  }
+}
+
+async function importGeneratedAvatar({ url, avatarCode }) {
+  const result = await apiRequest('/avatar/metaperson/import', {
+    method: 'POST',
+    body: JSON.stringify({ url, avatarCode }),
+  });
+  state.profile = saveProfile({
+    ...result.profile,
+    avatarMediaId: state.deviceAvatarMediaId,
+  });
+  state.avatar.mode = 'hosted';
+  state.avatar.modelMediaId = '';
+  state.avatar.captureStatus = 'ready';
+  state.avatar.capturePreparedAt ||= new Date().toISOString();
+  state.avatar.builtAt = new Date().toISOString();
+  state.avatar.profileHandle = state.profile.handle;
+  state.avatar = saveAvatarConfig(state.avatar);
+  state.rigReport = null;
+}
+
+function closeMetaPersonDialog() {
+  metaPersonCreator.close();
+  document.querySelector('#avatar-creator-dialog')?.close();
+}
+
+function bindMetaPersonEvents() {
+  document
+    .querySelector('[data-action="generate-3d-twin"]')
+    ?.addEventListener('click', async () => {
+      const portrait = avatarPortraitRecord();
+      if (!portrait || !state.avatar.consentAt) return;
+      state.avatar.captureStatus = 'ready';
+      state.avatar.capturePreparedAt = new Date().toISOString();
+      state.avatar.profileHandle = state.profile.handle;
+      state.avatar = saveAvatarConfig(state.avatar);
+      const dialog = document.querySelector('#avatar-creator-dialog');
+      const frame = document.querySelector('#avatar-creator-frame');
+      if (!dialog || !frame) return;
+      dialog.showModal();
+      await metaPersonCreator.open({ frame, portrait: portrait.blob });
+    });
+  document
+    .querySelector('[data-action="close-avatar-creator"]')
+    ?.addEventListener('click', closeMetaPersonDialog);
+  document
+    .querySelector('#avatar-creator-dialog')
+    ?.addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeMetaPersonDialog();
+    });
+  document
+    .querySelector('[data-action="export-avatar"]')
+    ?.addEventListener('click', () => metaPersonCreator.exportAvatar());
+}
+
+function bindVoiceRuntimeEvents() {
+  document.querySelectorAll('input[name="voiceRuntime"]').forEach((input) => {
+    input.addEventListener('change', () => {
+      if (!input.checked) return;
+      state.voiceRuntime.mode = input.value;
+      state.voiceRuntime = saveVoiceRuntime(state.voiceRuntime);
+      if (state.voiceRuntime.mode === 'robosa') openLlmRuntime.disconnect();
+      render();
+    });
+  });
+
+  document
+    .querySelector('#voice-runtime-endpoint')
+    ?.addEventListener('change', (event) => {
+      state.voiceRuntime.endpoint = event.currentTarget.value;
+      state.voiceRuntime = saveVoiceRuntime(state.voiceRuntime);
+      event.currentTarget.value = state.voiceRuntime.endpoint;
+      openLlmRuntime.disconnect();
+      updateRuntimeUi();
+    });
+
+  document
+    .querySelector('[data-action="test-runtime"]')
+    ?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await openLlmRuntime.test(state.voiceRuntime.endpoint);
+        showToast('Open-LLM-VTuber is connected.');
+      } catch (error) {
+        showToast(error.message);
+      } finally {
+        button.disabled = false;
+        updateRuntimeUi();
+      }
+    });
+}
+
+async function saveOwnerProfile({ quiet = false } = {}) {
+  if (state.authStatus !== 'owner') return false;
+  try {
+    const previousHandle = state.ownerHandle;
+    const result = await apiRequest('/profile', {
+      method: 'PUT',
+      body: JSON.stringify(state.profile),
+    });
+    state.ownerHandle = result.profile.handle;
+    if (state.avatar.profileHandle === previousHandle) {
+      state.avatar.profileHandle = result.profile.handle;
+      state.avatar = saveAvatarConfig(state.avatar);
+    }
+    state.profile = saveProfile({
+      ...result.profile,
+      avatarMediaId: state.deviceAvatarMediaId,
+    });
+    if (!quiet) showToast('Twin changes saved to your account.');
+    return true;
+  } catch (error) {
+    showToast(error.message);
+    return false;
+  }
+}
+
+async function logoutOwner() {
+  try {
+    await apiRequest('/auth/logout', { method: 'POST' });
+  } catch {
+    // Clear the local owner view even if the server session already expired.
+  }
+  state.authStatus = 'guest';
+  state.owner = null;
+  state.ownerHandle = '';
+  state.bookings = [];
+  showToast('Signed out.');
+  render();
+}
+
+async function updateBookingStatus(bookingId, status) {
+  try {
+    const result = await apiRequest(`/bookings/${bookingId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status }),
+    });
+    state.bookings = state.bookings.map((booking) =>
+      booking.id === result.booking.id ? result.booking : booking,
+    );
+    showToast(
+      status === 'approved' ? 'Request approved.' : 'Request declined.',
+    );
+    render();
+  } catch (error) {
+    showToast(error.message);
+  }
 }
 
 function bindMediaEvents() {
@@ -692,11 +1444,67 @@ function bindMediaEvents() {
   document.querySelectorAll('[data-action="set-avatar"]').forEach((button) => {
     button.addEventListener('click', () => {
       state.profile.avatarMediaId = button.dataset.mediaId;
+      state.deviceAvatarMediaId = button.dataset.mediaId;
+      state.avatar.portraitMediaId = button.dataset.mediaId;
+      state.avatar.profileHandle = state.profile.handle;
+      state.avatar.captureStatus = 'draft';
+      state.avatar.capturePreparedAt = '';
+      state.avatar = saveAvatarConfig(state.avatar);
       state.profile = saveProfile(state.profile);
-      showToast('Public portrait updated.');
+      showToast('3D portrait source updated.');
       render();
     });
   });
+
+  document
+    .querySelectorAll('[data-action="set-reference-video"]')
+    .forEach((button) => {
+      button.addEventListener('click', () => {
+        state.avatar.referenceVideoId = button.dataset.mediaId;
+        state.avatar.profileHandle = state.profile.handle;
+        state.avatar.captureStatus = 'draft';
+        state.avatar.capturePreparedAt = '';
+        state.avatar = saveAvatarConfig(state.avatar);
+        showToast('Motion reference selected.');
+        render();
+      });
+    });
+
+  document
+    .querySelectorAll('[data-action="use-3d-model"]')
+    .forEach((button) => {
+      button.addEventListener('click', () => {
+        state.avatar.modelMediaId = button.dataset.mediaId;
+        state.avatar.profileHandle = state.profile.handle;
+        state.avatar.mode = 'model';
+        state.avatar.builtAt = new Date().toISOString();
+        state.rigReport = null;
+        state.avatar = saveAvatarConfig(state.avatar);
+        showToast('3D model activated. Inspecting its facial rig.');
+        render();
+      });
+    });
+
+  document
+    .querySelector('[data-action="test-lip-sync"]')
+    ?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      await twinStage?.previewLipSync();
+      button.disabled = state.rigReport?.level === 'none';
+    });
+
+  document
+    .querySelector('#avatar-consent')
+    ?.addEventListener('change', (event) => {
+      state.avatar.consentAt = event.currentTarget.checked
+        ? new Date().toISOString()
+        : '';
+      state.avatar.captureStatus = 'draft';
+      state.avatar.capturePreparedAt = '';
+      state.avatar = saveAvatarConfig(state.avatar);
+      render();
+    });
 
   document
     .querySelectorAll('[data-action="remove-media"]')
@@ -710,8 +1518,23 @@ function bindMediaEvents() {
         state.media = state.media.filter((record) => record.id !== id);
         if (state.profile.avatarMediaId === id) {
           state.profile.avatarMediaId = '';
+          state.deviceAvatarMediaId = '';
           state.profile = saveProfile(state.profile);
         }
+        if (state.avatar.portraitMediaId === id) {
+          state.avatar.portraitMediaId = '';
+        }
+        if (state.avatar.referenceVideoId === id) {
+          state.avatar.referenceVideoId = '';
+        }
+        if (state.avatar.modelMediaId === id) {
+          state.avatar.modelMediaId = '';
+          state.avatar.mode = 'procedural';
+          state.rigReport = null;
+        }
+        state.avatar.captureStatus = 'draft';
+        state.avatar.capturePreparedAt = '';
+        state.avatar = saveAvatarConfig(state.avatar);
         showToast('Media removed from this browser.');
         render();
       });
@@ -724,8 +1547,13 @@ async function handleMediaFiles(fileList) {
   let added = 0;
 
   for (const file of files) {
-    if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) {
-      showToast(`${file.name} is not an image or video.`);
+    const isModel = /\.(glb|vrm)$/i.test(file.name);
+    if (
+      !file.type.startsWith('image/') &&
+      !file.type.startsWith('video/') &&
+      !isModel
+    ) {
+      showToast(`${file.name} is not an image, video, GLB, or VRM model.`);
       continue;
     }
     if (file.size > MAX_MEDIA_BYTES) {
@@ -737,6 +1565,14 @@ async function handleMediaFiles(fileList) {
       state.media.unshift(record);
       if (!state.profile.avatarMediaId && mediaKind(record) === 'image') {
         state.profile.avatarMediaId = record.id;
+        state.deviceAvatarMediaId = record.id;
+        state.avatar.portraitMediaId = record.id;
+      }
+      if (!state.avatar.referenceVideoId && mediaKind(record) === 'video') {
+        state.avatar.referenceVideoId = record.id;
+      }
+      if (!state.avatar.modelMediaId && mediaKind(record) === 'model') {
+        state.avatar.modelMediaId = record.id;
       }
       added += 1;
     } catch {
@@ -745,6 +1581,11 @@ async function handleMediaFiles(fileList) {
   }
 
   state.profile = saveProfile(state.profile);
+  if (added) {
+    state.avatar.captureStatus = 'draft';
+    state.avatar.capturePreparedAt = '';
+  }
+  state.avatar = saveAvatarConfig(state.avatar);
   if (added)
     showToast(`${added} media ${added === 1 ? 'item' : 'items'} added.`);
   render();
@@ -760,6 +1601,7 @@ function bindPublicEvents() {
     .querySelector('[data-action="toggle-audio"]')
     ?.addEventListener('click', () => {
       state.audioEnabled = !state.audioEnabled;
+      openLlmRuntime.setAudioEnabled(state.audioEnabled);
       if (!state.audioEnabled) voice.stopSpeaking();
       render();
     });
@@ -824,22 +1666,50 @@ function updateVoiceUi() {
     ?.classList.toggle('is-speaking', state.speaking);
 }
 
-function sendMessage(input) {
+async function sendMessage(input) {
   const text = String(input || '').trim();
   if (!text || state.pendingReply) return;
-  voice.stopSpeaking();
+  stopAllSpeech();
   state.messages.push({ role: 'user', text });
   state.pendingReply = true;
   render();
 
-  window.setTimeout(() => {
-    const response = answerTwin(state.profile, text);
-    state.messages.push({ role: 'assistant', text: response.text });
-    state.pendingReply = false;
-    render();
-    if (state.audioEnabled) voice.speak(response.text);
-    if (response.action === 'booking') openBookingDialog();
-  }, 420);
+  let response;
+  try {
+    if (state.voiceRuntime.mode === 'open-llm-vtuber') {
+      openLlmRuntime.setAudioEnabled(state.audioEnabled);
+      response = await openLlmRuntime.ask(text, state.voiceRuntime.endpoint);
+      response.action = null;
+    } else {
+      response = await apiRequest(
+        `/profiles/${encodeURIComponent(state.activeHandle || state.profile.handle)}/chat`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            message: text,
+            conversationId: state.conversationId,
+          }),
+        },
+      );
+      state.conversationId = response.conversationId;
+    }
+  } catch (error) {
+    response =
+      state.voiceRuntime.mode === 'open-llm-vtuber'
+        ? {
+            text: `${error.message} Switch to Robosa grounded mode in the Voice settings or start the configured runtime.`,
+            action: null,
+          }
+        : error.status
+          ? { text: error.message, action: null }
+          : answerTwin(state.profile, text);
+  }
+  state.messages.push({ role: 'assistant', text: response.text });
+  state.pendingReply = false;
+  render();
+  if (state.audioEnabled && state.voiceRuntime.mode !== 'open-llm-vtuber')
+    voice.speak(response.text);
+  if (response.action === 'booking') openBookingDialog();
 }
 
 function scrollMessagesToEnd() {
@@ -857,32 +1727,38 @@ function closeBookingDialog() {
   document.querySelector('#booking-dialog')?.close();
 }
 
-function submitBookingRequest(event) {
+async function submitBookingRequest(event) {
   event.preventDefault();
   if (!state.selectedSlot) {
     showToast('Choose a proposed meeting time.');
     return;
   }
   const form = new FormData(event.currentTarget);
-  const booking = saveBookingRequest({
-    slot: state.selectedSlot,
-    guestName: form.get('guestName'),
-    guestEmail: form.get('guestEmail'),
-  });
-  state.bookings = loadBookingRequests();
-  state.selectedSlot = '';
-  state.messages.push({
-    role: 'assistant',
-    text: `Your prototype meeting request for ${booking.slot} is saved in this browser. No invitation has been sent yet.`,
-  });
-  closeBookingDialog();
-  render();
-  if (state.audioEnabled) {
-    voice.speak(
-      'Your meeting request is saved. No invitation has been sent yet.',
+  const submit = event.currentTarget.querySelector('[type="submit"]');
+  submit.disabled = true;
+  try {
+    const result = await apiRequest(
+      `/profiles/${encodeURIComponent(state.activeHandle || state.profile.handle)}/bookings`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          slot: state.selectedSlot,
+          guestName: form.get('guestName'),
+          guestEmail: form.get('guestEmail'),
+        }),
+      },
     );
+    state.selectedSlot = '';
+    const confirmation = `Your meeting request for ${result.booking.slot} is awaiting owner approval. No calendar event has been created yet.`;
+    state.messages.push({ role: 'assistant', text: confirmation });
+    closeBookingDialog();
+    render();
+    if (state.audioEnabled) voice.speak(confirmation);
+    showToast('Meeting request sent for approval.');
+  } catch (error) {
+    showToast(error.message);
+    submit.disabled = false;
   }
-  showToast('Meeting request saved locally.');
 }
 
 async function copyShareLink() {
@@ -895,18 +1771,26 @@ async function copyShareLink() {
   }
 }
 
-window.addEventListener('popstate', render);
+window.addEventListener('popstate', async () => {
+  await hydrateRoute();
+  render();
+});
 window.addEventListener('beforeunload', () => {
+  disposeTwinStage();
+  metaPersonCreator.close();
   voice.dispose();
+  openLlmRuntime.dispose();
   state.mediaUrls.forEach((url) => URL.revokeObjectURL(url));
 });
 
 async function start() {
+  openLlmRuntime.setAudioEnabled(state.audioEnabled);
   try {
     state.media = await listMedia();
   } catch {
     state.media = [];
   }
+  await hydrateRoute();
   render();
 }
 
